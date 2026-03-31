@@ -5,6 +5,7 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 
+use crate::decode::audio_decoder::{AudioDecoder, DecodedAudio};
 use crate::decode::demuxer::{self, DemuxerInfo};
 use crate::decode::video_decoder::{DecodedFrame, VideoDecoder};
 
@@ -17,6 +18,7 @@ pub enum PipelineCommand {
 pub struct MediaPipeline {
     pub info: DemuxerInfo,
     pub frame_rx: Receiver<DecodedFrame>,
+    pub audio_rx: Option<Receiver<DecodedAudio>>,
     pub cmd_tx: Sender<PipelineCommand>,
     running: Arc<AtomicBool>,
 }
@@ -25,28 +27,28 @@ impl MediaPipeline {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         ffmpeg::init()?;
 
-        // Open once to get info
         let (_, info) = demuxer::open_input(path)?;
 
-        let video_stream = info.video.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
-        let video_stream_index = video_stream.index;
+        let video_stream_index = info.video.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No video stream found"))?
+            .index;
         let audio_stream_index = info.audio.as_ref().map(|a| a.index);
 
         let (frame_tx, frame_rx) = bounded::<DecodedFrame>(8);
+        let (audio_tx, audio_rx) = bounded::<DecodedAudio>(32);
         let (cmd_tx, cmd_rx) = bounded::<PipelineCommand>(16);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
         let path_owned = path.to_string();
+        let has_audio = audio_stream_index.is_some();
 
-        // Spawn thread — all FFmpeg objects created inside (no Send issues)
         thread::Builder::new()
             .name("demux-decode".to_string())
             .spawn(move || {
                 if let Err(e) = decode_thread(
                     &path_owned, video_stream_index, audio_stream_index,
-                    frame_tx, cmd_rx, running_clone,
+                    frame_tx, audio_tx, cmd_rx, running_clone,
                 ) {
                     log::error!("Decode thread error: {}", e);
                 }
@@ -55,6 +57,7 @@ impl MediaPipeline {
         Ok(Self {
             info,
             frame_rx,
+            audio_rx: if has_audio { Some(audio_rx) } else { None },
             cmd_tx,
             running,
         })
@@ -75,18 +78,21 @@ impl Drop for MediaPipeline {
 fn decode_thread(
     path: &str,
     video_stream_index: usize,
-    _audio_stream_index: Option<usize>,
+    audio_stream_index: Option<usize>,
     frame_tx: Sender<DecodedFrame>,
+    audio_tx: Sender<DecodedAudio>,
     cmd_rx: Receiver<PipelineCommand>,
     running: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (mut ictx, _) = demuxer::open_input(path)?;
     let mut video_decoder = VideoDecoder::new(&ictx, video_stream_index)?;
+    let mut audio_decoder = audio_stream_index.map(|idx| {
+        AudioDecoder::new(&ictx, idx)
+    }).transpose()?;
 
     let mut paused = false;
 
     for (stream, packet) in ictx.packets() {
-        // Check commands (non-blocking)
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 PipelineCommand::Stop => return Ok(()),
@@ -99,7 +105,6 @@ fn decode_thread(
             return Ok(());
         }
 
-        // Wait while paused
         while paused && running.load(Ordering::Relaxed) {
             match cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(PipelineCommand::Stop) => return Ok(()),
@@ -109,35 +114,60 @@ fn decode_thread(
             }
         }
 
-        if stream.index() == video_stream_index {
+        let idx = stream.index();
+
+        if idx == video_stream_index {
             if video_decoder.send_packet(&packet).is_err() {
                 continue;
             }
-
             loop {
                 match video_decoder.receive_frame() {
                     Ok(Some(frame)) => {
-                        if frame_tx.send(frame).is_err() {
-                            return Ok(());
-                        }
+                        if frame_tx.send(frame).is_err() { return Ok(()); }
                     }
                     Ok(None) => break,
                     Err(_) => break,
                 }
             }
+        } else if Some(idx) == audio_stream_index {
+            if let Some(ref mut adec) = audio_decoder {
+                if adec.send_packet(&packet).is_err() {
+                    continue;
+                }
+                loop {
+                    match adec.receive_frame() {
+                        Ok(Some(audio)) => {
+                            if audio_tx.send(audio).is_err() { return Ok(()); }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
         }
     }
 
-    // Flush
+    // Flush video
     let _ = video_decoder.send_eof();
     loop {
         match video_decoder.receive_frame() {
             Ok(Some(frame)) => {
-                if frame_tx.send(frame).is_err() {
-                    return Ok(());
-                }
+                if frame_tx.send(frame).is_err() { return Ok(()); }
             }
             _ => break,
+        }
+    }
+
+    // Flush audio
+    if let Some(ref mut adec) = audio_decoder {
+        let _ = adec.send_eof();
+        loop {
+            match adec.receive_frame() {
+                Ok(Some(audio)) => {
+                    if audio_tx.send(audio).is_err() { return Ok(()); }
+                }
+                _ => break,
+            }
         }
     }
 

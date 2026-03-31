@@ -120,6 +120,7 @@ impl ApplicationHandler for RPlayer {
                                 if let Some(pipeline) = app.pipeline.take() {
                                     pipeline.stop();
                                 }
+                                app.audio_output = None;
                                 app.ui_state.playback_state = app::PlaybackState::Stopped;
                                 app.ui_state.current_time = 0.0;
                                 app.window.set_title(config::APP_NAME);
@@ -127,9 +128,15 @@ impl ApplicationHandler for RPlayer {
                         }
                         PhysicalKey::Code(KeyCode::ArrowUp) => {
                             app.ui_state.volume = (app.ui_state.volume + config::VOLUME_STEP).min(config::MAX_VOLUME);
+                            if let Some(ref audio) = app.audio_output {
+                                audio.set_volume(app.ui_state.volume);
+                            }
                         }
                         PhysicalKey::Code(KeyCode::ArrowDown) => {
                             app.ui_state.volume = (app.ui_state.volume - config::VOLUME_STEP).max(0.0);
+                            if let Some(ref audio) = app.audio_output {
+                                audio.set_volume(app.ui_state.volume);
+                            }
                         }
                         PhysicalKey::Code(KeyCode::BracketRight) => {
                             app.ui_state.speed = (app.ui_state.speed + config::SPEED_STEP).min(config::MAX_SPEED);
@@ -139,6 +146,9 @@ impl ApplicationHandler for RPlayer {
                         }
                         PhysicalKey::Code(KeyCode::KeyM) => {
                             app.ui_state.muted = !app.ui_state.muted;
+                            if let Some(ref audio) = app.audio_output {
+                                audio.set_muted(app.ui_state.muted);
+                            }
                         }
                         _ => {}
                     }

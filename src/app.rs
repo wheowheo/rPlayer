@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::window::Window;
 
+use crate::audio::output::AudioOutput;
 use crate::config;
-use crate::decode::video_decoder::DecodedFrame;
-use crate::media::pipeline::{MediaPipeline, PipelineCommand};
+use crate::media::pipeline::MediaPipeline;
 use crate::video::renderer::VideoRenderer;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,6 +46,7 @@ pub struct App {
 
     // Media
     pub pipeline: Option<MediaPipeline>,
+    pub audio_output: Option<AudioOutput>,
     last_frame_time: Option<Instant>,
     last_pts: f64,
 
@@ -188,6 +189,7 @@ impl App {
                 video_info: String::new(),
             },
             pipeline: None,
+            audio_output: None,
             last_frame_time: None,
             last_pts: 0.0,
             window,
@@ -200,9 +202,10 @@ impl App {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.stop();
         }
+        self.audio_output = None;
 
         match MediaPipeline::open(path) {
-            Ok(pipeline) => {
+            Ok(mut pipeline) => {
                 let info = &pipeline.info;
                 self.ui_state.duration = info.duration_secs;
                 self.video_size = Some((info.video_width, info.video_height));
@@ -221,6 +224,19 @@ impl App {
                     let w = (info.video_width as f64 * scale) as u32;
                     let h = config::DEFAULT_HEIGHT;
                     let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+                }
+
+                // Start audio output if audio stream exists
+                if let Some(audio_rx) = pipeline.audio_rx.take() {
+                    match AudioOutput::new(audio_rx) {
+                        Ok(audio) => {
+                            audio.set_volume(self.ui_state.volume);
+                            audio.set_muted(self.ui_state.muted);
+                            self.audio_output = Some(audio);
+                            log::info!("Audio output started");
+                        }
+                        Err(e) => log::error!("Failed to start audio: {}", e),
+                    }
                 }
 
                 self.pipeline = Some(pipeline);
