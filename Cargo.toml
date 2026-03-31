@@ -42,7 +42,7 @@ pollster = "0.4"
 [target.'cfg(target_os = "windows")'.dependencies]
 
 [features]
-default = ["camera"]
+default = []
 camera = ["dep:nokhwa"]
 ai = []
 

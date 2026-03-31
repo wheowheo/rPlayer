@@ -1,1 +1,1 @@
-// Phase 7: clothing DB
+pub mod clothing;
