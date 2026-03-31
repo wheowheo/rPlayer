@@ -52,6 +52,8 @@ pub struct UiState {
     pub decode_mode: String,
     pub show_context_menu: bool,
     pub context_menu_pos: egui::Pos2,
+    pub frames_dropped: u64,
+    pub frames_displayed: u64,
 }
 
 pub struct App {
@@ -339,6 +341,22 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     ui.label(egui::RichText::new(
                         format!("decoder: {}", state.decode_mode)
                     ).monospace().size(14.0));
+                    let drop_rate = if state.frames_displayed > 0 {
+                        state.frames_dropped as f64 / (state.frames_displayed + state.frames_dropped) as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let drop_color = if drop_rate > 5.0 {
+                        egui::Color32::from_rgb(255, 80, 80)
+                    } else if drop_rate > 1.0 {
+                        egui::Color32::from_rgb(255, 200, 80)
+                    } else {
+                        egui::Color32::from_rgb(80, 255, 80)
+                    };
+                    ui.label(egui::RichText::new(
+                        format!("frames: {} ok / {} drop ({:.1}%)",
+                            state.frames_displayed, state.frames_dropped, drop_rate)
+                    ).monospace().size(14.0).color(drop_color));
                 });
             });
     }
@@ -510,6 +528,8 @@ impl App {
                 decode_mode: "SW".to_string(),
                 show_context_menu: false,
                 context_menu_pos: egui::Pos2::ZERO,
+                frames_dropped: 0,
+                frames_displayed: 0,
             },
             pipeline: None,
             audio_output: None,
@@ -614,6 +634,7 @@ impl App {
         let Some(pipeline) = &self.pipeline else { return };
         let Some(clock) = &mut self.clock else { return };
 
+        let is_frozen = clock.is_frozen();
         let clock_time = clock.time();
         self.ui_state.current_time = clock_time;
 
@@ -624,6 +645,7 @@ impl App {
         };
 
         let mut frames_dropped = 0u32;
+        let mut displayed = false;
         loop {
             let frame = if self.pending_frame.is_some() {
                 self.pending_frame.take().unwrap()
@@ -639,16 +661,28 @@ impl App {
                 }
             };
 
-            if frame.pts_secs < 0.0 {
+            // Skip sentinel frames
+            if frame.planes.is_empty() || frame.pts_secs < 0.0 {
                 continue;
+            }
+
+            // If clock is frozen (after seek), display the first valid frame immediately
+            if is_frozen {
+                self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+                displayed = true;
+                self.ui_state.frames_displayed += 1;
+                break;
             }
 
             let diff = frame.pts_secs - clock_time;
 
             if diff < -frame_duration * 2.0 {
                 frames_dropped += 1;
+                self.ui_state.frames_dropped += 1;
                 if frames_dropped > 30 {
                     self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+                    displayed = true;
+                    self.ui_state.frames_displayed += 1;
                     break;
                 }
                 continue;
@@ -657,9 +691,23 @@ impl App {
                 break;
             } else {
                 self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+                displayed = true;
+                self.ui_state.frames_displayed += 1;
                 break;
             }
         }
+
+        // Unfreeze clock after first frame is displayed post-seek
+        if is_frozen && displayed {
+            if let Some(ref mut clock) = self.clock {
+                clock.unfreeze();
+            }
+            // Resume audio now that video is ready
+            if let Some(ref audio) = self.audio_output {
+                audio.set_paused(false);
+            }
+        }
+
         if frames_dropped > 0 {
             log::debug!("Dropped {} late frames (clock={:.3})", frames_dropped, clock_time);
         }
@@ -790,11 +838,13 @@ impl App {
 
     pub fn seek(&mut self, target: f64) {
         let target = target.clamp(0.0, self.ui_state.duration);
+        // Pause audio immediately to prevent sound before video
+        if let Some(ref audio) = self.audio_output {
+            audio.set_paused(true);
+            audio.flush();
+        }
         if let Some(p) = &self.pipeline {
             let _ = p.cmd_tx.send(PipelineCommand::Seek(target));
-        }
-        if let Some(ref audio) = self.audio_output {
-            audio.flush();
         }
         if let Some(ref mut clock) = self.clock {
             clock.reset_for_seek(target);

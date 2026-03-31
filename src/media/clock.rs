@@ -4,24 +4,23 @@ use std::time::Instant;
 
 use crate::config;
 
-/// Master clock for A/V synchronization.
-/// Audio clock is primary; wall clock is fallback when audio stalls.
 pub struct Clock {
-    // Audio-driven PTS (set by audio callback via samples consumed)
     audio_samples_played: Arc<AtomicU64>,
     audio_sample_rate: u32,
 
-    // Wall clock fallback
     wall_base: Option<Instant>,
     wall_pts_at_base: f64,
 
-    // State
     last_audio_time: f64,
     last_audio_update: Instant,
     using_wall_clock: bool,
 
     speed: f64,
-    base_offset: f64, // added to computed time (for seek)
+    base_offset: f64,
+
+    /// After seek, clock is frozen until unfreeze() is called (first video frame displayed)
+    frozen: bool,
+    frozen_time: f64,
 }
 
 impl Clock {
@@ -36,10 +35,11 @@ impl Clock {
             using_wall_clock: false,
             speed: 1.0,
             base_offset: 0.0,
+            frozen: false,
+            frozen_time: 0.0,
         }
     }
 
-    /// Create a clock without audio (wall clock only)
     pub fn wall_only() -> Self {
         Self {
             audio_samples_played: Arc::new(AtomicU64::new(0)),
@@ -51,14 +51,14 @@ impl Clock {
             using_wall_clock: true,
             speed: 1.0,
             base_offset: 0.0,
+            frozen: false,
+            frozen_time: 0.0,
         }
     }
 
     pub fn set_speed(&mut self, speed: f64) {
-        // Snapshot current time before changing speed
         let now = self.time();
         self.speed = speed;
-        // Switch to wall clock for speed != 1.0 (audio plays at 1x, video needs to run faster)
         self.wall_base = Some(Instant::now());
         self.wall_pts_at_base = now;
         if speed != 1.0 {
@@ -66,8 +66,11 @@ impl Clock {
         }
     }
 
-    /// Get current playback time in seconds
     pub fn time(&mut self) -> f64 {
+        if self.frozen {
+            return self.frozen_time;
+        }
+
         if self.using_wall_clock {
             return self.wall_time();
         }
@@ -77,19 +80,15 @@ impl Clock {
             + (samples as f64 / self.audio_sample_rate as f64);
 
         let now = Instant::now();
-
-        // Give audio time to start (first 500ms: use wall clock, don't judge stall)
         let time_since_last_update = now.duration_since(self.last_audio_update).as_secs_f64();
 
         if samples == 0 && time_since_last_update < 1.0 {
-            // Audio hasn't started yet — use wall clock temporarily
-            return self.base_offset + time_since_last_update * self.speed;
+            return self.base_offset;
         }
 
-        // Detect audio stall (only after audio has started)
         if (audio_time - self.last_audio_time).abs() < 0.001 && samples > 0 {
             if time_since_last_update > config::AUDIO_STALL_TIMEOUT_SECS {
-                log::debug!("Audio stall detected ({:.3}s), wall clock fallback", time_since_last_update);
+                log::debug!("Audio stall ({:.3}s), wall clock fallback", time_since_last_update);
                 self.using_wall_clock = true;
                 self.wall_base = Some(now);
                 self.wall_pts_at_base = audio_time;
@@ -112,19 +111,36 @@ impl Clock {
         }
     }
 
-    /// Reset clock after seek. Must also reset the external samples_played atomic.
+    /// After seek: freeze clock at target until first video frame arrives
     pub fn reset_for_seek(&mut self, target_secs: f64) {
         self.audio_samples_played.store(0, Ordering::Relaxed);
         self.base_offset = target_secs;
         self.last_audio_time = target_secs;
         self.last_audio_update = Instant::now();
+        self.frozen = true;
+        self.frozen_time = target_secs;
+        // Wall clock / audio clock will be set up on unfreeze
+    }
+
+    /// Called when first video frame after seek is displayed — resume clock
+    pub fn unfreeze(&mut self) {
+        if !self.frozen {
+            return;
+        }
+        self.frozen = false;
+        self.audio_samples_played.store(0, Ordering::Relaxed);
+        self.last_audio_update = Instant::now();
         if self.speed == 1.0 {
             self.using_wall_clock = false;
         } else {
             self.wall_base = Some(Instant::now());
-            self.wall_pts_at_base = target_secs;
+            self.wall_pts_at_base = self.frozen_time;
             self.using_wall_clock = true;
         }
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     #[allow(dead_code)]
