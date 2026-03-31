@@ -20,13 +20,13 @@ mod video;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
-use app::App;
+use app::{App, UiAction};
 
 struct RPlayer {
     app: Option<App>,
@@ -61,7 +61,6 @@ impl ApplicationHandler for RPlayer {
         let mut app = pollster::block_on(App::new(window.clone()))
             .expect("Failed to initialize app");
 
-        // Open file from command line argument
         if let Some(path) = self.pending_file.take() {
             app.open_file(&path);
         }
@@ -79,6 +78,7 @@ impl ApplicationHandler for RPlayer {
 
         let response = app.egui_state.on_window_event(&app.window, &event);
         if response.consumed {
+            app.window.request_redraw();
             return;
         }
 
@@ -93,108 +93,45 @@ impl ApplicationHandler for RPlayer {
                 app.resize(size.width, size.height);
                 app.window.request_redraw();
             }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                // Right-click context menu
+                if let Some(pos) = app.egui_ctx.input(|i| i.pointer.latest_pos()) {
+                    app.ui_state.show_context_menu = true;
+                    app.ui_state.context_menu_pos = pos;
+                }
+                app.window.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state.is_pressed() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyO) => {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Video", &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v"])
-                                .pick_file()
-                            {
-                                app.open_file(&path.to_string_lossy());
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::Space) => {
-                            match app.ui_state.playback_state {
-                                app::PlaybackState::Playing => {
-                                    app.ui_state.playback_state = app::PlaybackState::Paused;
-                                    if let Some(p) = &app.pipeline {
-                                        let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Pause);
-                                    }
-                                    if let Some(ref audio) = app.audio_output {
-                                        audio.set_paused(true);
-                                    }
-                                }
-                                app::PlaybackState::Paused => {
-                                    app.ui_state.playback_state = app::PlaybackState::Playing;
-                                    if let Some(p) = &app.pipeline {
-                                        let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Resume);
-                                    }
-                                    if let Some(ref audio) = app.audio_output {
-                                        audio.set_paused(false);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            if app.ui_state.playback_state != app::PlaybackState::Empty {
-                                if let Some(pipeline) = app.pipeline.take() {
-                                    pipeline.stop();
-                                }
-                                app.audio_output = None;
-                                app.ui_state.playback_state = app::PlaybackState::Stopped;
-                                app.ui_state.current_time = 0.0;
-                                app.window.set_title(config::APP_NAME);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowUp) => {
-                            app.ui_state.volume = (app.ui_state.volume + config::VOLUME_STEP).min(config::MAX_VOLUME);
-                            if let Some(ref audio) = app.audio_output {
-                                audio.set_volume(app.ui_state.volume);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowDown) => {
-                            app.ui_state.volume = (app.ui_state.volume - config::VOLUME_STEP).max(0.0);
-                            if let Some(ref audio) = app.audio_output {
-                                audio.set_volume(app.ui_state.volume);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowRight) => {
-                            let target = app.ui_state.current_time + config::SEEK_STEP_SECS;
-                            app.seek(target);
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                            let target = app.ui_state.current_time - config::SEEK_STEP_SECS;
-                            app.seek(target);
-                        }
-                        PhysicalKey::Code(KeyCode::BracketRight) => {
-                            app.ui_state.speed = (app.ui_state.speed + config::SPEED_STEP).min(config::MAX_SPEED);
-                            if let Some(ref mut clock) = app.clock {
-                                clock.set_speed(app.ui_state.speed);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::BracketLeft) => {
-                            app.ui_state.speed = (app.ui_state.speed - config::SPEED_STEP).max(config::MIN_SPEED);
-                            if let Some(ref mut clock) = app.clock {
-                                clock.set_speed(app.ui_state.speed);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::KeyM) => {
-                            app.ui_state.muted = !app.ui_state.muted;
-                            if let Some(ref audio) = app.audio_output {
-                                audio.set_muted(app.ui_state.muted);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::Tab) => {
-                            app.ui_state.show_info_overlay = !app.ui_state.show_info_overlay;
-                        }
+                    let action = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyO) => UiAction::OpenFile,
+                        PhysicalKey::Code(KeyCode::Space) => UiAction::PlayPause,
+                        PhysicalKey::Code(KeyCode::Escape) => UiAction::Stop,
+                        PhysicalKey::Code(KeyCode::ArrowRight) => UiAction::SeekForward,
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => UiAction::SeekBackward,
+                        PhysicalKey::Code(KeyCode::ArrowUp) => UiAction::VolumeUp,
+                        PhysicalKey::Code(KeyCode::ArrowDown) => UiAction::VolumeDown,
+                        PhysicalKey::Code(KeyCode::BracketRight) => UiAction::SpeedUp,
+                        PhysicalKey::Code(KeyCode::BracketLeft) => UiAction::SpeedDown,
+                        PhysicalKey::Code(KeyCode::KeyM) => UiAction::MuteToggle,
+                        PhysicalKey::Code(KeyCode::Tab) => UiAction::ToggleInfoOverlay,
+                        PhysicalKey::Code(KeyCode::KeyR) => UiAction::ToggleDecoder,
                         PhysicalKey::Code(KeyCode::Equal) => {
-                            // + key: subtitle sync forward
                             if let Some(ref mut sub) = app.subtitle {
                                 sub.adjust_sync(0.5);
                             }
+                            UiAction::None
                         }
                         PhysicalKey::Code(KeyCode::Minus) => {
-                            // - key: subtitle sync backward
                             if let Some(ref mut sub) = app.subtitle {
                                 sub.adjust_sync(-0.5);
                             }
+                            UiAction::None
                         }
-                        PhysicalKey::Code(KeyCode::KeyR) => {
-                            app.toggle_decode_mode();
-                        }
-                        _ => {}
+                        _ => UiAction::None,
+                    };
+                    if action != UiAction::None {
+                        app.handle_action(&action);
                     }
                 }
                 app.window.request_redraw();

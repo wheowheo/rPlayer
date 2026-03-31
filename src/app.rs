@@ -20,6 +20,24 @@ pub enum PlaybackState {
     Buffering,
 }
 
+/// UI actions returned from draw_ui, processed by the app
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiAction {
+    None,
+    OpenFile,
+    PlayPause,
+    Stop,
+    SeekForward,
+    SeekBackward,
+    VolumeUp,
+    VolumeDown,
+    MuteToggle,
+    SpeedUp,
+    SpeedDown,
+    ToggleDecoder,
+    ToggleInfoOverlay,
+}
+
 pub struct UiState {
     pub playback_state: PlaybackState,
     pub volume: f64,
@@ -31,6 +49,8 @@ pub struct UiState {
     pub show_info_overlay: bool,
     pub subtitle_text: String,
     pub decode_mode: String,
+    pub show_context_menu: bool,
+    pub context_menu_pos: egui::Pos2,
 }
 
 pub struct App {
@@ -66,52 +86,277 @@ pub struct App {
     pub video_size: Option<(u32, u32)>,
 }
 
-fn draw_ui(ctx: &egui::Context, state: &UiState) {
-    // Status bar at bottom
-    egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            let state_text = match state.playback_state {
-                PlaybackState::Empty => "파일을 열어주세요 (O)",
-                PlaybackState::Playing => "재생 중",
-                PlaybackState::Paused => "일시정지",
-                PlaybackState::Stopped => "정지",
-                PlaybackState::Buffering => "버퍼링...",
-            };
-            ui.label(state_text);
-            ui.separator();
+fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
+    let mut actions = Vec::new();
 
-            if state.duration > 0.0 {
-                let cur = format_time(state.current_time);
-                let dur = format_time(state.duration);
-                ui.label(format!("{cur} / {dur}"));
+    // ========== Top menu bar ==========
+    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("파일", |ui| {
+                if ui.button("  \u{1F4C2}  열기...  (O)").clicked() {
+                    actions.push(UiAction::OpenFile);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("재생", |ui| {
+                let play_label = match state.playback_state {
+                    PlaybackState::Playing => "  \u{23F8}  일시정지  (Space)",
+                    _ => "  \u{25B6}  재생  (Space)",
+                };
+                if ui.button(play_label).clicked() {
+                    actions.push(UiAction::PlayPause);
+                    ui.close_menu();
+                }
+                if ui.button("  \u{23F9}  정지  (Esc)").clicked() {
+                    actions.push(UiAction::Stop);
+                    ui.close_menu();
+                }
                 ui.separator();
-            }
-
-            let vol_text = if state.muted {
-                "음소거".to_string()
-            } else {
-                format!("볼륨: {:.0}%", state.volume * 100.0)
-            };
-            ui.label(vol_text);
-            ui.separator();
-            ui.label(format!("배속: {:.2}x", state.speed));
-
-            if !state.decode_mode.is_empty() {
+                if ui.button("  \u{23EA}  5초 뒤로  (\u{2190})").clicked() {
+                    actions.push(UiAction::SeekBackward);
+                    ui.close_menu();
+                }
+                if ui.button("  \u{23E9}  5초 앞으로  (\u{2192})").clicked() {
+                    actions.push(UiAction::SeekForward);
+                    ui.close_menu();
+                }
                 ui.separator();
-                ui.label(&state.decode_mode);
-            }
-
-            if !state.video_info.is_empty() {
+                if ui.button(format!("  \u{23F2}  배속 감소  ([)  {:.2}x", state.speed)).clicked() {
+                    actions.push(UiAction::SpeedDown);
+                    ui.close_menu();
+                }
+                if ui.button(format!("  \u{23F1}  배속 증가  (])  {:.2}x", state.speed)).clicked() {
+                    actions.push(UiAction::SpeedUp);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("오디오", |ui| {
+                if ui.button("  \u{1F50A}  볼륨 증가  (\u{2191})").clicked() {
+                    actions.push(UiAction::VolumeUp);
+                    ui.close_menu();
+                }
+                if ui.button("  \u{1F509}  볼륨 감소  (\u{2193})").clicked() {
+                    actions.push(UiAction::VolumeDown);
+                    ui.close_menu();
+                }
+                let mute_label = if state.muted {
+                    "  \u{1F507}  음소거 해제  (M)"
+                } else {
+                    "  \u{1F508}  음소거  (M)"
+                };
+                if ui.button(mute_label).clicked() {
+                    actions.push(UiAction::MuteToggle);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("보기", |ui| {
+                let info_label = if state.show_info_overlay {
+                    "  \u{2139}  정보 숨기기  (Tab)"
+                } else {
+                    "  \u{2139}  정보 보기  (Tab)"
+                };
+                if ui.button(info_label).clicked() {
+                    actions.push(UiAction::ToggleInfoOverlay);
+                    ui.close_menu();
+                }
                 ui.separator();
-                ui.label(&state.video_info);
-            }
+                let dec_label = format!("  \u{1F3AC}  디코더 전환  (R)  [{}]", state.decode_mode);
+                if ui.button(dec_label).clicked() {
+                    actions.push(UiAction::ToggleDecoder);
+                    ui.close_menu();
+                }
+            });
         });
     });
 
-    // Info overlay (Tab)
+    // ========== Bottom control bar ==========
+    egui::TopBottomPanel::bottom("control_bar").show(ctx, |ui| {
+        // Seek bar
+        if state.duration > 0.0 {
+            let mut seek_pos = state.current_time as f32;
+            let response = ui.add(
+                egui::Slider::new(&mut seek_pos, 0.0..=state.duration as f32)
+                    .show_value(false)
+                    .trailing_fill(true)
+            );
+            if response.changed() {
+                state.current_time = seek_pos as f64;
+                actions.push(UiAction::None); // seek handled below
+            }
+            if response.drag_stopped() {
+                // will be handled by the caller via state.current_time
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+
+            // Play/Pause
+            let play_icon = match state.playback_state {
+                PlaybackState::Playing => "\u{23F8}",
+                _ => "\u{25B6}\u{FE0F}",
+            };
+            if ui.button(egui::RichText::new(play_icon).size(18.0)).clicked() {
+                actions.push(UiAction::PlayPause);
+            }
+
+            // Stop
+            if ui.button(egui::RichText::new("\u{23F9}").size(18.0)).clicked() {
+                actions.push(UiAction::Stop);
+            }
+
+            ui.add_space(4.0);
+
+            // Seek backward
+            if ui.button(egui::RichText::new("\u{23EA}").size(16.0)).on_hover_text("5초 뒤로").clicked() {
+                actions.push(UiAction::SeekBackward);
+            }
+
+            // Seek forward
+            if ui.button(egui::RichText::new("\u{23E9}").size(16.0)).on_hover_text("5초 앞으로").clicked() {
+                actions.push(UiAction::SeekForward);
+            }
+
+            ui.add_space(8.0);
+
+            // Time
+            if state.duration > 0.0 {
+                ui.label(format!(
+                    "{} / {}",
+                    format_time(state.current_time),
+                    format_time(state.duration)
+                ));
+            }
+
+            // Right-aligned: volume + speed + decoder
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Decoder mode
+                ui.label(egui::RichText::new(&state.decode_mode).small());
+                ui.separator();
+
+                // Speed
+                ui.label(format!("{:.2}x", state.speed));
+                if ui.button(egui::RichText::new("\u{23F1}").size(14.0)).on_hover_text("배속 증가 (])").clicked() {
+                    actions.push(UiAction::SpeedUp);
+                }
+                if ui.button(egui::RichText::new("\u{23F2}").size(14.0)).on_hover_text("배속 감소 ([)").clicked() {
+                    actions.push(UiAction::SpeedDown);
+                }
+                ui.separator();
+
+                // Volume
+                let vol_icon = if state.muted {
+                    "\u{1F507}"
+                } else if state.volume < 0.3 {
+                    "\u{1F508}"
+                } else if state.volume < 0.7 {
+                    "\u{1F509}"
+                } else {
+                    "\u{1F50A}"
+                };
+                if ui.button(egui::RichText::new(vol_icon).size(16.0)).on_hover_text("음소거 (M)").clicked() {
+                    actions.push(UiAction::MuteToggle);
+                }
+
+                let mut vol = state.volume as f32;
+                let vol_resp = ui.add(
+                    egui::Slider::new(&mut vol, 0.0..=2.0)
+                        .show_value(false)
+                        .fixed_decimals(0)
+                );
+                if vol_resp.changed() {
+                    state.volume = vol as f64;
+                    actions.push(UiAction::VolumeUp); // triggers set_volume
+                }
+                ui.label(format!("{:.0}%", state.volume * 100.0));
+            });
+        });
+    });
+
+    // ========== Context menu (right-click) ==========
+    if state.show_context_menu {
+        let pos = state.context_menu_pos;
+        egui::Area::new(egui::Id::new("context_menu"))
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(180.0);
+
+                    if ui.button("  \u{1F4C2}  파일 열기...").clicked() {
+                        actions.push(UiAction::OpenFile);
+                        state.show_context_menu = false;
+                    }
+                    ui.separator();
+
+                    let play_label = match state.playback_state {
+                        PlaybackState::Playing => "  \u{23F8}  일시정지",
+                        _ => "  \u{25B6}\u{FE0F}  재생",
+                    };
+                    if ui.button(play_label).clicked() {
+                        actions.push(UiAction::PlayPause);
+                        state.show_context_menu = false;
+                    }
+                    if ui.button("  \u{23F9}  정지").clicked() {
+                        actions.push(UiAction::Stop);
+                        state.show_context_menu = false;
+                    }
+                    ui.separator();
+
+                    if ui.button("  \u{23EA}  5초 뒤로").clicked() {
+                        actions.push(UiAction::SeekBackward);
+                        state.show_context_menu = false;
+                    }
+                    if ui.button("  \u{23E9}  5초 앞으로").clicked() {
+                        actions.push(UiAction::SeekForward);
+                        state.show_context_menu = false;
+                    }
+                    ui.separator();
+
+                    let vol_text = if state.muted {
+                        "  \u{1F507}  음소거 해제".to_string()
+                    } else {
+                        format!("  \u{1F50A}  음소거  (볼륨 {:.0}%)", state.volume * 100.0)
+                    };
+                    if ui.button(vol_text).clicked() {
+                        actions.push(UiAction::MuteToggle);
+                        state.show_context_menu = false;
+                    }
+                    ui.separator();
+
+                    let dec_text = format!("  \u{1F3AC}  디코더: {}", state.decode_mode);
+                    if ui.button(dec_text).clicked() {
+                        actions.push(UiAction::ToggleDecoder);
+                        state.show_context_menu = false;
+                    }
+
+                    let info_text = if state.show_info_overlay {
+                        "  \u{2139}  정보 숨기기"
+                    } else {
+                        "  \u{2139}  정보 보기"
+                    };
+                    if ui.button(info_text).clicked() {
+                        actions.push(UiAction::ToggleInfoOverlay);
+                        state.show_context_menu = false;
+                    }
+                });
+            });
+
+        // Close on click outside
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            let ptr = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            // Check if click is outside the menu area (rough)
+            let menu_rect = egui::Rect::from_min_size(pos, egui::vec2(200.0, 300.0));
+            if !menu_rect.contains(ptr) {
+                state.show_context_menu = false;
+            }
+        }
+    }
+
+    // ========== Info overlay (Tab) ==========
     if state.show_info_overlay {
         egui::Area::new(egui::Id::new("info_overlay"))
-            .fixed_pos(egui::pos2(10.0, 10.0))
+            .fixed_pos(egui::pos2(10.0, 36.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new(&state.video_info).monospace().size(14.0));
@@ -132,11 +377,11 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             });
     }
 
-    // Subtitle overlay
+    // ========== Subtitle overlay ==========
     if !state.subtitle_text.is_empty() {
         let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("subtitle"))
-            .fixed_pos(egui::pos2(screen.center().x, screen.max.y - 80.0))
+            .fixed_pos(egui::pos2(screen.center().x, screen.max.y - 100.0))
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -152,6 +397,8 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
                     });
             });
     }
+
+    actions
 }
 
 fn format_time(secs: f64) -> String {
@@ -252,6 +499,8 @@ impl App {
                 show_info_overlay: false,
                 subtitle_text: String::new(),
                 decode_mode: "SW".to_string(),
+                show_context_menu: false,
+                context_menu_pos: egui::Pos2::ZERO,
             },
             pipeline: None,
             audio_output: None,
@@ -265,7 +514,6 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &str) {
-        // Stop existing pipeline
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.stop();
         }
@@ -285,7 +533,6 @@ impl App {
                     info.video_width, info.video_height, codec, info.video_fps
                 );
 
-                // Resize window to video aspect ratio
                 if info.video_width > 0 && info.video_height > 0 {
                     let scale = (config::DEFAULT_HEIGHT as f64) / (info.video_height as f64);
                     let w = (info.video_width as f64 * scale) as u32;
@@ -293,7 +540,6 @@ impl App {
                     let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
                 }
 
-                // Start audio output and clock
                 let samples_played = Arc::new(AtomicU64::new(0));
                 if let Some(audio_rx) = pipeline.audio_rx.take() {
                     match AudioOutput::new(audio_rx, samples_played.clone()) {
@@ -320,7 +566,6 @@ impl App {
                 self.ui_state.subtitle_text.clear();
                 self.pending_frame = None;
 
-                // Auto-detect subtitle file (same name, .srt or .smi)
                 let path_base = std::path::Path::new(path);
                 let stem = path_base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 let dir = path_base.parent().unwrap_or(std::path::Path::new("."));
@@ -369,7 +614,6 @@ impl App {
             1.0 / 30.0
         };
 
-        // Try to get a frame to display
         let mut frames_dropped = 0u32;
         loop {
             let frame = if self.pending_frame.is_some() {
@@ -386,7 +630,6 @@ impl App {
                 }
             };
 
-            // Skip sentinel frames (from seek drain)
             if frame.pts_secs < 0.0 {
                 continue;
             }
@@ -394,10 +637,8 @@ impl App {
             let diff = frame.pts_secs - clock_time;
 
             if diff < -frame_duration * 2.0 {
-                // Frame is late — drop it and try next
                 frames_dropped += 1;
                 if frames_dropped > 30 {
-                    // Too many drops — just show something
                     self.video_renderer.upload_rgba_frame(
                         &self.device, &self.queue,
                         frame.width, frame.height, &frame.data,
@@ -406,11 +647,9 @@ impl App {
                 }
                 continue;
             } else if diff > config::SYNC_THRESHOLD_SECS {
-                // Frame is early — save for next render cycle
                 self.pending_frame = Some(frame);
                 break;
             } else {
-                // Display this frame
                 self.video_renderer.upload_rgba_frame(
                     &self.device, &self.queue,
                     frame.width, frame.height, &frame.data,
@@ -422,12 +661,102 @@ impl App {
             log::debug!("Dropped {} late frames (clock={:.3})", frames_dropped, clock_time);
         }
 
-        // Update subtitle
         if let Some(ref subtitle) = self.subtitle {
             if let Some(text) = subtitle.current_text(clock_time) {
                 self.ui_state.subtitle_text = text.to_string();
             } else {
                 self.ui_state.subtitle_text.clear();
+            }
+        }
+    }
+
+    /// Process a UI action
+    pub fn handle_action(&mut self, action: &UiAction) {
+        match action {
+            UiAction::None => {}
+            UiAction::OpenFile => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v"])
+                    .pick_file()
+                {
+                    self.open_file(&path.to_string_lossy());
+                }
+            }
+            UiAction::PlayPause => {
+                match self.ui_state.playback_state {
+                    PlaybackState::Playing => {
+                        self.ui_state.playback_state = PlaybackState::Paused;
+                        if let Some(p) = &self.pipeline {
+                            let _ = p.cmd_tx.send(PipelineCommand::Pause);
+                        }
+                        if let Some(ref audio) = self.audio_output {
+                            audio.set_paused(true);
+                        }
+                    }
+                    PlaybackState::Paused => {
+                        self.ui_state.playback_state = PlaybackState::Playing;
+                        if let Some(p) = &self.pipeline {
+                            let _ = p.cmd_tx.send(PipelineCommand::Resume);
+                        }
+                        if let Some(ref audio) = self.audio_output {
+                            audio.set_paused(false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            UiAction::Stop => {
+                if self.ui_state.playback_state != PlaybackState::Empty {
+                    if let Some(pipeline) = self.pipeline.take() {
+                        pipeline.stop();
+                    }
+                    self.audio_output = None;
+                    self.ui_state.playback_state = PlaybackState::Stopped;
+                    self.ui_state.current_time = 0.0;
+                    self.window.set_title(config::APP_NAME);
+                }
+            }
+            UiAction::SeekForward => {
+                self.seek(self.ui_state.current_time + config::SEEK_STEP_SECS);
+            }
+            UiAction::SeekBackward => {
+                self.seek(self.ui_state.current_time - config::SEEK_STEP_SECS);
+            }
+            UiAction::VolumeUp => {
+                self.ui_state.volume = (self.ui_state.volume + config::VOLUME_STEP).min(config::MAX_VOLUME);
+                if let Some(ref audio) = self.audio_output {
+                    audio.set_volume(self.ui_state.volume);
+                }
+            }
+            UiAction::VolumeDown => {
+                self.ui_state.volume = (self.ui_state.volume - config::VOLUME_STEP).max(0.0);
+                if let Some(ref audio) = self.audio_output {
+                    audio.set_volume(self.ui_state.volume);
+                }
+            }
+            UiAction::MuteToggle => {
+                self.ui_state.muted = !self.ui_state.muted;
+                if let Some(ref audio) = self.audio_output {
+                    audio.set_muted(self.ui_state.muted);
+                }
+            }
+            UiAction::SpeedUp => {
+                self.ui_state.speed = (self.ui_state.speed + config::SPEED_STEP).min(config::MAX_SPEED);
+                if let Some(ref mut clock) = self.clock {
+                    clock.set_speed(self.ui_state.speed);
+                }
+            }
+            UiAction::SpeedDown => {
+                self.ui_state.speed = (self.ui_state.speed - config::SPEED_STEP).max(config::MIN_SPEED);
+                if let Some(ref mut clock) = self.clock {
+                    clock.set_speed(self.ui_state.speed);
+                }
+            }
+            UiAction::ToggleDecoder => {
+                self.toggle_decode_mode();
+            }
+            UiAction::ToggleInfoOverlay => {
+                self.ui_state.show_info_overlay = !self.ui_state.show_info_overlay;
             }
         }
     }
@@ -456,9 +785,8 @@ impl App {
     pub fn seek(&mut self, target: f64) {
         let target = target.clamp(0.0, self.ui_state.duration);
         if let Some(p) = &self.pipeline {
-            let _ = p.cmd_tx.send(crate::media::pipeline::PipelineCommand::Seek(target));
+            let _ = p.cmd_tx.send(PipelineCommand::Seek(target));
         }
-        // Flush audio buffer and reset clock
         if let Some(ref audio) = self.audio_output {
             audio.flush();
         }
@@ -514,8 +842,23 @@ impl App {
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            draw_ui(ctx, &self.ui_state);
+            let actions = draw_ui(ctx, &mut self.ui_state);
+            // Store actions for processing after render
+            // We use ctx.memory to stash them
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("ui_actions"), actions));
         });
+
+        // Process UI actions
+        let actions: Vec<UiAction> = self.egui_ctx.data_mut(|d| {
+            d.get_temp(egui::Id::new("ui_actions")).unwrap_or_default()
+        });
+        for action in &actions {
+            self.handle_action(action);
+        }
+        // Sync volume slider back to audio
+        if let Some(ref audio) = self.audio_output {
+            audio.set_volume(self.ui_state.volume);
+        }
 
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
 
