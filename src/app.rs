@@ -41,6 +41,7 @@ pub enum UiAction {
 
 pub struct UiState {
     pub playback_state: PlaybackState,
+    pub render_fps: f64,
     pub volume: f64,
     pub speed: f64,
     pub muted: bool,
@@ -80,6 +81,8 @@ pub struct App {
     pub clock: Option<Clock>,
     pub pending_frame: Option<RawFrame>,
     video_fps: f64,
+    fps_counter: u32,
+    fps_last_time: std::time::Instant,
 
     // Subtitle
     pub subtitle: Option<SubtitleTrack>,
@@ -327,7 +330,9 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
             .fixed_pos(egui::pos2(10.0, 36.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new(&state.video_info).monospace().size(14.0));
+                    ui.label(egui::RichText::new(
+                        format!("{} | render {:.0}fps", state.video_info, state.render_fps)
+                    ).monospace().size(14.0));
                     ui.label(egui::RichText::new(
                         format!("{} / {}", format_time(state.current_time), format_time(state.duration))
                     ).monospace().size(14.0));
@@ -526,6 +531,7 @@ impl App {
                 show_info_overlay: false,
                 subtitle_text: String::new(),
                 decode_mode: "SW".to_string(),
+                render_fps: 0.0,
                 show_context_menu: false,
                 context_menu_pos: egui::Pos2::ZERO,
                 frames_dropped: 0,
@@ -536,6 +542,8 @@ impl App {
             clock: None,
             pending_frame: None,
             video_fps: 0.0,
+            fps_counter: 0,
+            fps_last_time: std::time::Instant::now(),
             subtitle: None,
             window,
             video_size: None,
@@ -638,7 +646,7 @@ impl App {
         let clock_time = clock.time();
         self.ui_state.current_time = clock_time;
 
-        let frame_duration = if self.video_fps > 0.0 {
+        let _frame_duration = if self.video_fps > 0.0 {
             1.0 / self.video_fps
         } else {
             1.0 / 30.0
@@ -646,55 +654,44 @@ impl App {
 
         let mut frames_dropped = 0u32;
         let mut displayed = false;
+        let mut best_frame: Option<RawFrame> = self.pending_frame.take();
+        let mut disconnected = false;
+
+        // Drain all available frames from queue, keep only the best one
         loop {
-            let frame = if self.pending_frame.is_some() {
-                self.pending_frame.take().unwrap()
-            } else {
-                match pipeline.frame_rx.try_recv() {
-                    Ok(f) => f,
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        self.ui_state.playback_state = PlaybackState::Stopped;
-                        log::info!("Playback finished");
-                        return;
+            match pipeline.frame_rx.try_recv() {
+                Ok(frame) => {
+                    if frame.planes.is_empty() || frame.pts_secs < 0.0 {
+                        continue;
                     }
+                    if let Some(prev) = best_frame {
+                        // Drop the older one
+                        if frame.pts_secs >= prev.pts_secs {
+                            frames_dropped += 1;
+                            self.ui_state.frames_dropped += 1;
+                        }
+                    }
+                    best_frame = Some(frame);
                 }
-            };
-
-            // Skip sentinel frames
-            if frame.planes.is_empty() || frame.pts_secs < 0.0 {
-                continue;
-            }
-
-            // If clock is frozen (after seek), display the first valid frame immediately
-            if is_frozen {
-                self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
-                displayed = true;
-                self.ui_state.frames_displayed += 1;
-                break;
-            }
-
-            let diff = frame.pts_secs - clock_time;
-
-            if diff < -frame_duration * 2.0 {
-                frames_dropped += 1;
-                self.ui_state.frames_dropped += 1;
-                if frames_dropped > 30 {
-                    self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
-                    displayed = true;
-                    self.ui_state.frames_displayed += 1;
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
                     break;
                 }
-                continue;
-            } else if diff > config::SYNC_THRESHOLD_SECS {
-                self.pending_frame = Some(frame);
-                break;
-            } else {
-                self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
-                displayed = true;
-                self.ui_state.frames_displayed += 1;
-                break;
             }
+        }
+
+        // Display the best frame — always show it, never hold back
+        if let Some(frame) = best_frame {
+            self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+            displayed = true;
+            self.ui_state.frames_displayed += 1;
+        }
+
+        if disconnected && !displayed {
+            self.ui_state.playback_state = PlaybackState::Stopped;
+            log::info!("Playback finished");
+            return;
         }
 
         // Unfreeze clock after first frame is displayed post-seek
@@ -954,6 +951,16 @@ impl App {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // FPS counter
+        self.fps_counter += 1;
+        let elapsed = self.fps_last_time.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            self.ui_state.render_fps = self.fps_counter as f64 / elapsed;
+            log::debug!("render {:.1} fps", self.ui_state.render_fps);
+            self.fps_counter = 0;
+            self.fps_last_time = std::time::Instant::now();
+        }
 
         Ok(())
     }
