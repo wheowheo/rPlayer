@@ -77,8 +77,10 @@ impl ApplicationHandler for RPlayer {
         let Some(app) = self.app.as_mut() else { return };
 
         let response = app.egui_state.on_window_event(&app.window, &event);
-        if response.consumed {
+        if response.repaint {
             app.window.request_redraw();
+        }
+        if response.consumed {
             return;
         }
 
@@ -152,7 +154,11 @@ impl ApplicationHandler for RPlayer {
                     Err(e) => log::error!("Render error: {:?}", e),
                 }
 
-                if app.ui_state.playback_state == app::PlaybackState::Playing {
+                // Keep redrawing when playing or when egui needs repaint (menus, hover)
+                if app.ui_state.playback_state == app::PlaybackState::Playing
+                    || app.ui_state.show_context_menu
+                    || app.egui_ctx.requested_repaint_last_pass()
+                {
                     app.window.request_redraw();
                 }
             }

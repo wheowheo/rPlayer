@@ -89,79 +89,75 @@ pub struct App {
 fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
     let mut actions = Vec::new();
 
+    // Continuously repaint while menus/context are active
+    if state.show_context_menu {
+        ctx.request_repaint();
+    }
+
     // ========== Top menu bar ==========
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("파일", |ui| {
-                if ui.button("  \u{1F4C2}  열기...  (O)").clicked() {
+                if ui.button("열기...        O").clicked() {
                     actions.push(UiAction::OpenFile);
                     ui.close_menu();
                 }
             });
             ui.menu_button("재생", |ui| {
                 let play_label = match state.playback_state {
-                    PlaybackState::Playing => "  \u{23F8}  일시정지  (Space)",
-                    _ => "  \u{25B6}  재생  (Space)",
+                    PlaybackState::Playing => "|| 일시정지    Space",
+                    _ =>                      "|> 재생        Space",
                 };
                 if ui.button(play_label).clicked() {
                     actions.push(UiAction::PlayPause);
                     ui.close_menu();
                 }
-                if ui.button("  \u{23F9}  정지  (Esc)").clicked() {
+                if ui.button("[] 정지        Esc").clicked() {
                     actions.push(UiAction::Stop);
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("  \u{23EA}  5초 뒤로  (\u{2190})").clicked() {
+                if ui.button("<< 5초 뒤로").clicked() {
                     actions.push(UiAction::SeekBackward);
                     ui.close_menu();
                 }
-                if ui.button("  \u{23E9}  5초 앞으로  (\u{2192})").clicked() {
+                if ui.button(">> 5초 앞으로").clicked() {
                     actions.push(UiAction::SeekForward);
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button(format!("  \u{23F2}  배속 감소  ([)  {:.2}x", state.speed)).clicked() {
+                if ui.button(format!("느리게  [     {:.2}x", state.speed)).clicked() {
                     actions.push(UiAction::SpeedDown);
                     ui.close_menu();
                 }
-                if ui.button(format!("  \u{23F1}  배속 증가  (])  {:.2}x", state.speed)).clicked() {
+                if ui.button(format!("빠르게  ]     {:.2}x", state.speed)).clicked() {
                     actions.push(UiAction::SpeedUp);
                     ui.close_menu();
                 }
             });
             ui.menu_button("오디오", |ui| {
-                if ui.button("  \u{1F50A}  볼륨 증가  (\u{2191})").clicked() {
+                if ui.button("볼륨 +5%").clicked() {
                     actions.push(UiAction::VolumeUp);
                     ui.close_menu();
                 }
-                if ui.button("  \u{1F509}  볼륨 감소  (\u{2193})").clicked() {
+                if ui.button("볼륨 -5%").clicked() {
                     actions.push(UiAction::VolumeDown);
                     ui.close_menu();
                 }
-                let mute_label = if state.muted {
-                    "  \u{1F507}  음소거 해제  (M)"
-                } else {
-                    "  \u{1F508}  음소거  (M)"
-                };
+                let mute_label = if state.muted { "음소거 해제  M" } else { "음소거      M" };
                 if ui.button(mute_label).clicked() {
                     actions.push(UiAction::MuteToggle);
                     ui.close_menu();
                 }
             });
             ui.menu_button("보기", |ui| {
-                let info_label = if state.show_info_overlay {
-                    "  \u{2139}  정보 숨기기  (Tab)"
-                } else {
-                    "  \u{2139}  정보 보기  (Tab)"
-                };
+                let info_label = if state.show_info_overlay { "정보 숨기기  Tab" } else { "정보 보기    Tab" };
                 if ui.button(info_label).clicked() {
                     actions.push(UiAction::ToggleInfoOverlay);
                     ui.close_menu();
                 }
                 ui.separator();
-                let dec_label = format!("  \u{1F3AC}  디코더 전환  (R)  [{}]", state.decode_mode);
-                if ui.button(dec_label).clicked() {
+                if ui.button(format!("디코더 전환  R  [{}]", state.decode_mode)).clicked() {
                     actions.push(UiAction::ToggleDecoder);
                     ui.close_menu();
                 }
@@ -171,55 +167,43 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
 
     // ========== Bottom control bar ==========
     egui::TopBottomPanel::bottom("control_bar").show(ctx, |ui| {
-        // Seek bar
         if state.duration > 0.0 {
             let mut seek_pos = state.current_time as f32;
-            let response = ui.add(
+            let resp = ui.add(
                 egui::Slider::new(&mut seek_pos, 0.0..=state.duration as f32)
                     .show_value(false)
                     .trailing_fill(true)
             );
-            if response.changed() {
+            if resp.changed() {
                 state.current_time = seek_pos as f64;
-                actions.push(UiAction::None); // seek handled below
-            }
-            if response.drag_stopped() {
-                // will be handled by the caller via state.current_time
             }
         }
 
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 2.0;
 
-            // Play/Pause
-            let play_icon = match state.playback_state {
-                PlaybackState::Playing => "\u{23F8}",
-                _ => "\u{25B6}\u{FE0F}",
+            let play_text = match state.playback_state {
+                PlaybackState::Playing => "||",
+                _ => "|>",
             };
-            if ui.button(egui::RichText::new(play_icon).size(18.0)).clicked() {
+            if ui.button(play_text).clicked() {
                 actions.push(UiAction::PlayPause);
             }
-
-            // Stop
-            if ui.button(egui::RichText::new("\u{23F9}").size(18.0)).clicked() {
+            if ui.button("[]").clicked() {
                 actions.push(UiAction::Stop);
+            }
+
+            ui.add_space(2.0);
+
+            if ui.button("<<").on_hover_text("5\u{CD08} \u{B4A4}\u{B85C}").clicked() {
+                actions.push(UiAction::SeekBackward);
+            }
+            if ui.button(">>").on_hover_text("5\u{CD08} \u{C55E}\u{C73C}\u{B85C}").clicked() {
+                actions.push(UiAction::SeekForward);
             }
 
             ui.add_space(4.0);
 
-            // Seek backward
-            if ui.button(egui::RichText::new("\u{23EA}").size(16.0)).on_hover_text("5초 뒤로").clicked() {
-                actions.push(UiAction::SeekBackward);
-            }
-
-            // Seek forward
-            if ui.button(egui::RichText::new("\u{23E9}").size(16.0)).on_hover_text("5초 앞으로").clicked() {
-                actions.push(UiAction::SeekForward);
-            }
-
-            ui.add_space(8.0);
-
-            // Time
             if state.duration > 0.0 {
                 ui.label(format!(
                     "{} / {}",
@@ -228,33 +212,21 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 ));
             }
 
-            // Right-aligned: volume + speed + decoder
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Decoder mode
                 ui.label(egui::RichText::new(&state.decode_mode).small());
                 ui.separator();
 
-                // Speed
                 ui.label(format!("{:.2}x", state.speed));
-                if ui.button(egui::RichText::new("\u{23F1}").size(14.0)).on_hover_text("배속 증가 (])").clicked() {
+                if ui.button("+").on_hover_text("배속 증가 ]").clicked() {
                     actions.push(UiAction::SpeedUp);
                 }
-                if ui.button(egui::RichText::new("\u{23F2}").size(14.0)).on_hover_text("배속 감소 ([)").clicked() {
+                if ui.button("-").on_hover_text("배속 감소 [").clicked() {
                     actions.push(UiAction::SpeedDown);
                 }
                 ui.separator();
 
-                // Volume
-                let vol_icon = if state.muted {
-                    "\u{1F507}"
-                } else if state.volume < 0.3 {
-                    "\u{1F508}"
-                } else if state.volume < 0.7 {
-                    "\u{1F509}"
-                } else {
-                    "\u{1F50A}"
-                };
-                if ui.button(egui::RichText::new(vol_icon).size(16.0)).on_hover_text("음소거 (M)").clicked() {
+                let vol_label = if state.muted { "X" } else { "V" };
+                if ui.button(vol_label).on_hover_text("음소거 M").clicked() {
                     actions.push(UiAction::MuteToggle);
                 }
 
@@ -262,18 +234,17 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 let vol_resp = ui.add(
                     egui::Slider::new(&mut vol, 0.0..=2.0)
                         .show_value(false)
-                        .fixed_decimals(0)
                 );
                 if vol_resp.changed() {
                     state.volume = vol as f64;
-                    actions.push(UiAction::VolumeUp); // triggers set_volume
+                    actions.push(UiAction::VolumeUp);
                 }
                 ui.label(format!("{:.0}%", state.volume * 100.0));
             });
         });
     });
 
-    // ========== Context menu (right-click) ==========
+    // ========== Context menu (right-click / two-finger tap) ==========
     if state.show_context_menu {
         let pos = state.context_menu_pos;
         egui::Area::new(egui::Id::new("context_menu"))
@@ -281,42 +252,42 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(180.0);
+                    ui.set_min_width(160.0);
 
-                    if ui.button("  \u{1F4C2}  파일 열기...").clicked() {
+                    if ui.button("파일 열기...").clicked() {
                         actions.push(UiAction::OpenFile);
                         state.show_context_menu = false;
                     }
                     ui.separator();
 
                     let play_label = match state.playback_state {
-                        PlaybackState::Playing => "  \u{23F8}  일시정지",
-                        _ => "  \u{25B6}\u{FE0F}  재생",
+                        PlaybackState::Playing => "일시정지",
+                        _ => "재생",
                     };
                     if ui.button(play_label).clicked() {
                         actions.push(UiAction::PlayPause);
                         state.show_context_menu = false;
                     }
-                    if ui.button("  \u{23F9}  정지").clicked() {
+                    if ui.button("정지").clicked() {
                         actions.push(UiAction::Stop);
                         state.show_context_menu = false;
                     }
                     ui.separator();
 
-                    if ui.button("  \u{23EA}  5초 뒤로").clicked() {
+                    if ui.button("5초 뒤로").clicked() {
                         actions.push(UiAction::SeekBackward);
                         state.show_context_menu = false;
                     }
-                    if ui.button("  \u{23E9}  5초 앞으로").clicked() {
+                    if ui.button("5초 앞으로").clicked() {
                         actions.push(UiAction::SeekForward);
                         state.show_context_menu = false;
                     }
                     ui.separator();
 
                     let vol_text = if state.muted {
-                        "  \u{1F507}  음소거 해제".to_string()
+                        "음소거 해제".to_string()
                     } else {
-                        format!("  \u{1F50A}  음소거  (볼륨 {:.0}%)", state.volume * 100.0)
+                        format!("음소거 ({}%)", (state.volume * 100.0) as i32)
                     };
                     if ui.button(vol_text).clicked() {
                         actions.push(UiAction::MuteToggle);
@@ -324,17 +295,11 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     }
                     ui.separator();
 
-                    let dec_text = format!("  \u{1F3AC}  디코더: {}", state.decode_mode);
-                    if ui.button(dec_text).clicked() {
+                    if ui.button(format!("디코더: {}", state.decode_mode)).clicked() {
                         actions.push(UiAction::ToggleDecoder);
                         state.show_context_menu = false;
                     }
-
-                    let info_text = if state.show_info_overlay {
-                        "  \u{2139}  정보 숨기기"
-                    } else {
-                        "  \u{2139}  정보 보기"
-                    };
+                    let info_text = if state.show_info_overlay { "정보 숨기기" } else { "정보 보기" };
                     if ui.button(info_text).clicked() {
                         actions.push(UiAction::ToggleInfoOverlay);
                         state.show_context_menu = false;
@@ -342,14 +307,9 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 });
             });
 
-        // Close on click outside
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            let ptr = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
-            // Check if click is outside the menu area (rough)
-            let menu_rect = egui::Rect::from_min_size(pos, egui::vec2(200.0, 300.0));
-            if !menu_rect.contains(ptr) {
-                state.show_context_menu = false;
-            }
+        // Close on left-click outside
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            state.show_context_menu = false;
         }
     }
 
@@ -361,17 +321,17 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new(&state.video_info).monospace().size(14.0));
                     ui.label(egui::RichText::new(
-                        format!("시간: {} / {}", format_time(state.current_time), format_time(state.duration))
+                        format!("{} / {}", format_time(state.current_time), format_time(state.duration))
                     ).monospace().size(14.0));
                     ui.label(egui::RichText::new(
-                        format!("배속: {:.2}x | 볼륨: {:.0}%{}",
+                        format!("{:.2}x | {:.0}%{}",
                             state.speed,
                             state.volume * 100.0,
-                            if state.muted { " (음소거)" } else { "" }
+                            if state.muted { " (mute)" } else { "" }
                         )
                     ).monospace().size(14.0));
                     ui.label(egui::RichText::new(
-                        format!("디코더: {} (R로 전환)", state.decode_mode)
+                        format!("decoder: {}", state.decode_mode)
                     ).monospace().size(14.0));
                 });
             });
@@ -399,6 +359,47 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
     }
 
     actions
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Try loading system Korean font
+    let font_paths = [
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",           // macOS
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",   // macOS fallback
+        "C:\\Windows\\Fonts\\malgun.ttf",                        // Windows
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", // Linux
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ];
+
+    let mut loaded = false;
+    for path in &font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "korean".to_owned(),
+                egui::FontData::from_owned(data).into(),
+            );
+            // Prepend to proportional and monospace families
+            fonts.families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "korean".to_owned());
+            fonts.families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("korean".to_owned());
+            loaded = true;
+            log::info!("Loaded Korean font: {}", path);
+            break;
+        }
+    }
+
+    if !loaded {
+        log::warn!("Korean font not found, UI text may not render correctly");
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 fn format_time(secs: f64) -> String {
@@ -469,6 +470,8 @@ impl App {
         let video_renderer = VideoRenderer::new(&device, surface_format);
 
         let egui_ctx = egui::Context::default();
+        configure_fonts(&egui_ctx);
+
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui_ctx.viewport_id(),
