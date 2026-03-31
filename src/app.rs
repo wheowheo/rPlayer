@@ -96,6 +96,26 @@ pub struct App {
     pub video_size: Option<(u32, u32)>,
 }
 
+/// Draw a clickable icon button with custom vector graphics
+fn icon_button(
+    ui: &mut egui::Ui,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let size = egui::vec2(24.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let color = if resp.hovered() {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(200)
+    };
+    // Button background on hover
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(60));
+    }
+    draw(ui.painter(), rect, color);
+    resp
+}
+
 fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
     let mut actions = Vec::new();
 
@@ -226,25 +246,82 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
         }
 
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
 
-            let play_text = match state.playback_state {
-                PlaybackState::Playing => "||",
-                _ => "|>",
-            };
-            if ui.button(play_text).clicked() {
+            // Play/Pause icon button
+            if icon_button(ui, |p, r, c| {
+                if state.playback_state == PlaybackState::Playing {
+                    // Pause: two vertical bars
+                    let w = r.width() * 0.25;
+                    let pad = r.width() * 0.2;
+                    p.rect_filled(egui::Rect::from_min_size(
+                        egui::pos2(r.min.x + pad, r.min.y + pad), egui::vec2(w, r.height() - pad * 2.0)
+                    ), 0.0, c);
+                    p.rect_filled(egui::Rect::from_min_size(
+                        egui::pos2(r.max.x - pad - w, r.min.y + pad), egui::vec2(w, r.height() - pad * 2.0)
+                    ), 0.0, c);
+                } else {
+                    // Play: right-pointing triangle
+                    let pad = r.width() * 0.2;
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(r.min.x + pad, r.min.y + pad),
+                            egui::pos2(r.max.x - pad * 0.5, r.center().y),
+                            egui::pos2(r.min.x + pad, r.max.y - pad),
+                        ],
+                        c, egui::Stroke::NONE,
+                    ));
+                }
+            }).clicked() {
                 actions.push(UiAction::PlayPause);
             }
-            if ui.button("[]").clicked() {
+
+            // Stop icon button: filled square
+            if icon_button(ui, |p, r, c| {
+                let pad = r.width() * 0.25;
+                p.rect_filled(egui::Rect::from_min_max(
+                    egui::pos2(r.min.x + pad, r.min.y + pad),
+                    egui::pos2(r.max.x - pad, r.max.y - pad),
+                ), 1.0, c);
+            }).clicked() {
                 actions.push(UiAction::Stop);
             }
 
             ui.add_space(2.0);
 
-            if ui.button("<<").on_hover_text("5\u{CD08} \u{B4A4}\u{B85C}").clicked() {
+            // Rewind icon: two left triangles
+            if icon_button(ui, |p, r, c| {
+                let pad = r.width() * 0.15;
+                let mid = r.center().x;
+                for offset in [0.0, r.width() * 0.3] {
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(mid - offset, r.center().y),
+                            egui::pos2(mid - offset + r.width() * 0.35, r.min.y + pad),
+                            egui::pos2(mid - offset + r.width() * 0.35, r.max.y - pad),
+                        ],
+                        c, egui::Stroke::NONE,
+                    ));
+                }
+            }).on_hover_text("5초 뒤로").clicked() {
                 actions.push(UiAction::SeekBackward);
             }
-            if ui.button(">>").on_hover_text("5\u{CD08} \u{C55E}\u{C73C}\u{B85C}").clicked() {
+
+            // Forward icon: two right triangles
+            if icon_button(ui, |p, r, c| {
+                let pad = r.width() * 0.15;
+                let mid = r.center().x;
+                for offset in [0.0, r.width() * 0.3] {
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(mid + offset, r.center().y),
+                            egui::pos2(mid + offset - r.width() * 0.35, r.min.y + pad),
+                            egui::pos2(mid + offset - r.width() * 0.35, r.max.y - pad),
+                        ],
+                        c, egui::Stroke::NONE,
+                    ));
+                }
+            }).on_hover_text("5초 앞으로").clicked() {
                 actions.push(UiAction::SeekForward);
             }
 
@@ -271,8 +348,40 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 }
                 ui.separator();
 
-                let vol_label = if state.muted { "X" } else { "V" };
-                if ui.button(vol_label).on_hover_text("음소거 M").clicked() {
+                // Volume icon: speaker shape
+                if icon_button(ui, |p, r, c| {
+                    if state.muted {
+                        // X mark
+                        let pad = r.width() * 0.25;
+                        let s = egui::Stroke::new(2.0, c);
+                        p.line_segment([egui::pos2(r.min.x + pad, r.min.y + pad), egui::pos2(r.max.x - pad, r.max.y - pad)], s);
+                        p.line_segment([egui::pos2(r.max.x - pad, r.min.y + pad), egui::pos2(r.min.x + pad, r.max.y - pad)], s);
+                    } else {
+                        // Speaker: rectangle + triangle horn
+                        let cx = r.center().x - r.width() * 0.1;
+                        let cy = r.center().y;
+                        let h = r.height() * 0.25;
+                        let w = r.width() * 0.15;
+                        p.rect_filled(egui::Rect::from_center_size(
+                            egui::pos2(cx - w, cy), egui::vec2(w, h * 2.0)
+                        ), 0.0, c);
+                        p.add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(cx - w * 0.5, cy - h),
+                                egui::pos2(cx + w * 2.0, cy - h * 2.0),
+                                egui::pos2(cx + w * 2.0, cy + h * 2.0),
+                                egui::pos2(cx - w * 0.5, cy + h),
+                            ],
+                            c, egui::Stroke::NONE,
+                        ));
+                        // Sound waves (arcs)
+                        if state.volume > 0.3 {
+                            let s = egui::Stroke::new(1.5, c);
+                            p.line_segment([egui::pos2(cx + w * 3.0, cy - h), egui::pos2(cx + w * 3.5, cy)], s);
+                            p.line_segment([egui::pos2(cx + w * 3.5, cy), egui::pos2(cx + w * 3.0, cy + h)], s);
+                        }
+                    }
+                }).on_hover_text("음소거 M").clicked() {
                     actions.push(UiAction::MuteToggle);
                 }
 
