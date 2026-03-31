@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg pkgconf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rplayer-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rplayer
+
+  build-macos-universal:
+    needs: build-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ARM64
+        uses: actions/download-artifact@v4
+        with:
+          name: rplayer-aarch64-apple-darwin
+          path: arm64/
+
+      - name: Download x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: rplayer-x86_64-apple-darwin
+          path: x64/
+
+      - name: Create Universal Binary
+        run: |
+          chmod +x arm64/rplayer x64/rplayer
+          lipo -create arm64/rplayer x64/rplayer -output rplayer
+          file rplayer
+
+      - name: Package .app bundle
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          APP="rPlayer-${VERSION}.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp rplayer "$APP/Contents/MacOS/rplayer"
+          cp MANUAL.md "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key><string>rplayer</string>
+              <key>CFBundleIdentifier</key><string>com.rplayer.app</string>
+              <key>CFBundleName</key><string>rPlayer</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          tar czf "rplayer-macos-universal.tar.gz" "$APP" rplayer MANUAL.md
+
+      - name: Upload Universal
+        uses: actions/upload-artifact@v4
+        with:
+          name: rplayer-macos-universal
+          path: rplayer-macos-universal.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg (vcpkg)
+        run: |
+          vcpkg install ffmpeg:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+        env:
+          VCPKGRS_DYNAMIC: 1
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/rplayer.exe dist/
+          cp MANUAL.md dist/
+          Compress-Archive -Path dist/* -DestinationPath rplayer-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rplayer-windows-x64
+          path: rplayer-windows-x64.zip
+
+  release:
+    if: github.event_name == 'release'
+    needs: [build-macos-universal, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rplayer-macos-universal/rplayer-macos-universal.tar.gz
+            rplayer-windows-x64/rplayer-windows-x64.zip
