@@ -1,0 +1,57 @@
+[package]
+name = "rplayer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+# Video decoding
+ffmpeg-next = "8.1"
+
+# Audio output
+cpal = "0.15"
+rubato = "0.16"
+
+# Window + GPU rendering
+winit = "0.30"
+wgpu = "24"
+egui = "0.31"
+egui-winit = "0.31"
+egui-wgpu = "0.31"
+
+# File dialogs
+rfd = "0.15"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Utility
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+ringbuf = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+sysinfo = "0.33"
+pollster = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+
+[features]
+default = ["camera"]
+camera = ["dep:nokhwa"]
+ai = []
+
+[dependencies.nokhwa]
+version = "0.10"
+features = ["input-native"]
+optional = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
