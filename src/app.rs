@@ -646,52 +646,25 @@ impl App {
         let clock_time = clock.time();
         self.ui_state.current_time = clock_time;
 
-        let _frame_duration = if self.video_fps > 0.0 {
-            1.0 / self.video_fps
-        } else {
-            1.0 / 30.0
+        let mut displayed = false;
+
+        // Take exactly one frame per render — 1:1 mapping with display refresh
+        let frame = match pipeline.frame_rx.try_recv() {
+            Ok(f) => Some(f),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.ui_state.playback_state = PlaybackState::Stopped;
+                log::info!("Playback finished");
+                return;
+            }
         };
 
-        let mut frames_dropped = 0u32;
-        let mut displayed = false;
-        let mut best_frame: Option<RawFrame> = self.pending_frame.take();
-        let mut disconnected = false;
-
-        // Drain all available frames from queue, keep only the best one
-        loop {
-            match pipeline.frame_rx.try_recv() {
-                Ok(frame) => {
-                    if frame.planes.is_empty() || frame.pts_secs < 0.0 {
-                        continue;
-                    }
-                    if let Some(prev) = best_frame {
-                        // Drop the older one
-                        if frame.pts_secs >= prev.pts_secs {
-                            frames_dropped += 1;
-                            self.ui_state.frames_dropped += 1;
-                        }
-                    }
-                    best_frame = Some(frame);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
+        if let Some(frame) = frame {
+            if !frame.planes.is_empty() && frame.pts_secs >= 0.0 {
+                self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+                displayed = true;
+                self.ui_state.frames_displayed += 1;
             }
-        }
-
-        // Display the best frame — always show it, never hold back
-        if let Some(frame) = best_frame {
-            self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
-            displayed = true;
-            self.ui_state.frames_displayed += 1;
-        }
-
-        if disconnected && !displayed {
-            self.ui_state.playback_state = PlaybackState::Stopped;
-            log::info!("Playback finished");
-            return;
         }
 
         // Unfreeze clock after first frame is displayed post-seek
@@ -703,10 +676,6 @@ impl App {
             if let Some(ref audio) = self.audio_output {
                 audio.set_paused(false);
             }
-        }
-
-        if frames_dropped > 0 {
-            log::debug!("Dropped {} late frames (clock={:.3})", frames_dropped, clock_time);
         }
 
         if let Some(ref subtitle) = self.subtitle {

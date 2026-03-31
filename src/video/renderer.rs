@@ -24,7 +24,6 @@ pub enum FrameFormat {
     Rgba,
 }
 
-/// Raw decoded frame data — no CPU color conversion needed
 pub struct RawFrame {
     pub format: FrameFormat,
     pub width: u32,
@@ -35,13 +34,13 @@ pub struct RawFrame {
 
 pub struct PlaneData {
     pub data: Vec<u8>,
+    #[allow(dead_code)]
     pub stride: usize,
     pub width: u32,
     pub height: u32,
 }
 
 pub struct VideoRenderer {
-    // Pipelines per format
     pipeline_yuv: wgpu::RenderPipeline,
     pipeline_nv12: wgpu::RenderPipeline,
     pipeline_rgba: wgpu::RenderPipeline,
@@ -49,20 +48,18 @@ pub struct VideoRenderer {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
 
-    // YUV420P: 3 R8 textures
     layout_yuv: wgpu::BindGroupLayout,
-    // NV12: R8 + RG8 textures
     layout_nv12: wgpu::BindGroupLayout,
-    // RGBA: 1 RGBA texture
     layout_rgba: wgpu::BindGroupLayout,
 
     sampler: wgpu::Sampler,
+
+    // Cached state — only rebuild when format/size changes
     bind_group: Option<wgpu::BindGroup>,
     current_format: Option<FrameFormat>,
     texture_size: (u32, u32),
-
-    // Stored textures for reuse
     textures: Vec<wgpu::Texture>,
+    texture_views: Vec<wgpu::TextureView>,
 }
 
 impl VideoRenderer {
@@ -115,19 +112,14 @@ impl VideoRenderer {
             count: None,
         };
 
-        // YUV420P layout: Y(0), U(1), V(2), sampler(3)
         let layout_yuv = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("yuv_layout"),
             entries: &[tex_entry(0), tex_entry(1), tex_entry(2), sampler_entry(3)],
         });
-
-        // NV12 layout: Y(0), UV(1), sampler(2)
         let layout_nv12 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("nv12_layout"),
             entries: &[tex_entry(0), tex_entry(1), sampler_entry(2)],
         });
-
-        // RGBA layout: tex(0), sampler(1)
         let layout_rgba = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rgba_layout"),
             entries: &[tex_entry(0), sampler_entry(1)],
@@ -171,193 +163,140 @@ impl VideoRenderer {
             })
         };
 
-        let pipeline_yuv = make_pipeline(&layout_yuv, "fs_yuv", "yuv_pipeline");
-        let pipeline_nv12 = make_pipeline(&layout_nv12, "fs_nv12", "nv12_pipeline");
-        let pipeline_rgba = make_pipeline(&layout_rgba, "fs_rgba", "rgba_pipeline");
-
         Self {
-            pipeline_yuv,
-            pipeline_nv12,
-            pipeline_rgba,
+            pipeline_yuv: make_pipeline(&layout_yuv, "fs_yuv", "yuv_pipeline"),
+            pipeline_nv12: make_pipeline(&layout_nv12, "fs_nv12", "nv12_pipeline"),
+            pipeline_rgba: make_pipeline(&layout_rgba, "fs_rgba", "rgba_pipeline"),
             vertex_buffer,
             index_buffer,
-            layout_yuv,
-            layout_nv12,
-            layout_rgba,
+            layout_yuv, layout_nv12, layout_rgba,
             sampler,
             bind_group: None,
             current_format: None,
             texture_size: (0, 0),
             textures: Vec::new(),
+            texture_views: Vec::new(),
         }
     }
 
-    fn create_r8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
+    fn create_tex(device: &wgpu::Device, w: u32, h: u32, fmt: wgpu::TextureFormat, label: &str) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
+            mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: fmt,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
     }
 
-    fn create_rg8_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::Texture {
-        device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        })
-    }
-
-    fn write_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, plane: &PlaneData, bpp: u32) {
+    /// Fast texture upload — data is already tightly packed by decoder
+    fn write_plane_fast(queue: &wgpu::Queue, texture: &wgpu::Texture, plane: &PlaneData, bpp: u32) {
         let row_bytes = plane.width * bpp;
-        // Copy row by row if stride != row_bytes
-        if plane.stride as u32 == row_bytes {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &plane.data[..row_bytes as usize * plane.height as usize],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: Some(plane.height),
-                },
-                wgpu::Extent3d { width: plane.width, height: plane.height, depth_or_array_layers: 1 },
-            );
-        } else {
-            // Stride mismatch — pack rows tightly
-            let mut packed = Vec::with_capacity((row_bytes * plane.height) as usize);
-            for y in 0..plane.height as usize {
-                let start = y * plane.stride;
-                let end = start + row_bytes as usize;
-                if end <= plane.data.len() {
-                    packed.extend_from_slice(&plane.data[start..end]);
-                }
-            }
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &packed,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: Some(plane.height),
-                },
-                wgpu::Extent3d { width: plane.width, height: plane.height, depth_or_array_layers: 1 },
-            );
-        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &plane.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(plane.height),
+            },
+            wgpu::Extent3d { width: plane.width, height: plane.height, depth_or_array_layers: 1 },
+        );
     }
 
-    pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &RawFrame) {
-        let size_changed = self.texture_size != (frame.width, frame.height);
-        let format_changed = self.current_format != Some(frame.format);
-
-        if size_changed || format_changed {
-            self.textures.clear();
-            self.current_format = Some(frame.format);
-            self.texture_size = (frame.width, frame.height);
+    /// Rebuild textures + views + bind_group only when format/size changes
+    fn ensure_resources(&mut self, device: &wgpu::Device, frame: &RawFrame) {
+        let size_ok = self.texture_size == (frame.width, frame.height);
+        let fmt_ok = self.current_format == Some(frame.format);
+        if size_ok && fmt_ok && self.bind_group.is_some() {
+            return; // Reuse existing
         }
+
+        self.current_format = Some(frame.format);
+        self.texture_size = (frame.width, frame.height);
+        self.textures.clear();
+        self.texture_views.clear();
+
+        let (w, h) = (frame.width, frame.height);
+        let cw = w / 2;
+        let ch = h / 2;
 
         match frame.format {
             FrameFormat::Yuv420p => {
-                let cw = frame.width / 2;
-                let ch = frame.height / 2;
-
-                if self.textures.is_empty() {
-                    self.textures.push(Self::create_r8_texture(device, frame.width, frame.height, "Y"));
-                    self.textures.push(Self::create_r8_texture(device, cw, ch, "U"));
-                    self.textures.push(Self::create_r8_texture(device, cw, ch, "V"));
-                }
-
-                Self::write_plane(queue, &self.textures[0], &frame.planes[0], 1);
-                Self::write_plane(queue, &self.textures[1], &frame.planes[1], 1);
-                Self::write_plane(queue, &self.textures[2], &frame.planes[2], 1);
-
-                let views: Vec<_> = self.textures.iter()
-                    .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
-                    .collect();
-
-                self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("yuv_bg"),
-                    layout: &self.layout_yuv,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                }));
+                self.textures.push(Self::create_tex(device, w, h, wgpu::TextureFormat::R8Unorm, "Y"));
+                self.textures.push(Self::create_tex(device, cw, ch, wgpu::TextureFormat::R8Unorm, "U"));
+                self.textures.push(Self::create_tex(device, cw, ch, wgpu::TextureFormat::R8Unorm, "V"));
             }
             FrameFormat::Nv12 => {
-                let cw = frame.width / 2;
-                let ch = frame.height / 2;
-
-                if self.textures.is_empty() {
-                    self.textures.push(Self::create_r8_texture(device, frame.width, frame.height, "Y_nv12"));
-                    self.textures.push(Self::create_rg8_texture(device, cw, ch, "UV_nv12"));
-                }
-
-                Self::write_plane(queue, &self.textures[0], &frame.planes[0], 1);
-                Self::write_plane(queue, &self.textures[1], &frame.planes[1], 2);
-
-                let views: Vec<_> = self.textures.iter()
-                    .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
-                    .collect();
-
-                self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("nv12_bg"),
-                    layout: &self.layout_nv12,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                }));
+                self.textures.push(Self::create_tex(device, w, h, wgpu::TextureFormat::R8Unorm, "Y_nv12"));
+                self.textures.push(Self::create_tex(device, cw, ch, wgpu::TextureFormat::Rg8Unorm, "UV_nv12"));
             }
             FrameFormat::Rgba => {
-                if self.textures.is_empty() {
-                    self.textures.push(device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("rgba_tex"),
-                        size: wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    }));
-                }
-
-                Self::write_plane(queue, &self.textures[0], &frame.planes[0], 4);
-
-                let view = self.textures[0].create_view(&wgpu::TextureViewDescriptor::default());
-                self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("rgba_bg"),
-                    layout: &self.layout_rgba,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                }));
+                self.textures.push(Self::create_tex(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "rgba"));
             }
         }
+
+        self.texture_views = self.textures.iter()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect();
+
+        self.rebuild_bind_group(device, frame.format);
+    }
+
+    fn rebuild_bind_group(&mut self, device: &wgpu::Device, format: FrameFormat) {
+        let views = &self.texture_views;
+        self.bind_group = Some(match format {
+            FrameFormat::Yuv420p => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv_bg"), layout: &self.layout_yuv,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            }),
+            FrameFormat::Nv12 => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nv12_bg"), layout: &self.layout_nv12,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            }),
+            FrameFormat::Rgba => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rgba_bg"), layout: &self.layout_rgba,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            }),
+        });
+    }
+
+    pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &RawFrame) {
+        self.ensure_resources(device, frame);
+
+        match frame.format {
+            FrameFormat::Yuv420p => {
+                Self::write_plane_fast(queue, &self.textures[0], &frame.planes[0], 1);
+                Self::write_plane_fast(queue, &self.textures[1], &frame.planes[1], 1);
+                Self::write_plane_fast(queue, &self.textures[2], &frame.planes[2], 1);
+            }
+            FrameFormat::Nv12 => {
+                Self::write_plane_fast(queue, &self.textures[0], &frame.planes[0], 1);
+                Self::write_plane_fast(queue, &self.textures[1], &frame.planes[1], 2);
+            }
+            FrameFormat::Rgba => {
+                Self::write_plane_fast(queue, &self.textures[0], &frame.planes[0], 4);
+            }
+        }
+        // bind_group already points to these textures — no rebuild needed
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -12,7 +13,7 @@ pub struct AudioOutput {
     volume: Arc<AtomicU64>,
     muted: Arc<AtomicU64>,
     samples_played: Arc<AtomicU64>,
-    buffer: Arc<Mutex<Vec<f32>>>,
+    buffer: Arc<Mutex<VecDeque<f32>>>,
     paused: Arc<AtomicBool>,
     #[allow(dead_code)]
     sample_rate: u32,
@@ -41,64 +42,49 @@ impl AudioOutput {
         let samples_played_clone = samples_played.clone();
         let paused_clone = paused.clone();
 
-        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
-            config::AUDIO_RING_BUFFER_SIZE,
-        )));
-        let buffer_clone = buffer.clone();
+        let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(
+            VecDeque::with_capacity(config::AUDIO_RING_BUFFER_SIZE),
+        ));
+        let buffer_feed = buffer.clone();
         let buffer_callback = buffer.clone();
 
-        // Feed thread: moves decoded audio from channel to buffer
         std::thread::Builder::new()
             .name("audio-feed".to_string())
             .spawn(move || {
                 while let Ok(audio) = audio_rx.recv() {
-                    let mut buf = buffer_clone.lock();
-                    // Cap buffer at a reasonable size to prevent unbounded growth
-                    // But DON'T drain old data — let backpressure handle it
+                    let mut buf = buffer_feed.lock();
                     if buf.len() < config::AUDIO_RING_BUFFER_SIZE * 2 {
-                        buf.extend_from_slice(&audio.data);
+                        buf.extend(audio.data.iter());
                     }
-                    // If buffer is full, drop this packet (preferable to dropping played data)
                 }
             })?;
 
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let is_paused = paused_clone.load(Ordering::Relaxed);
-                if is_paused {
-                    for sample in data.iter_mut() {
-                        *sample = 0.0;
-                    }
+                if paused_clone.load(Ordering::Relaxed) {
+                    for s in data.iter_mut() { *s = 0.0; }
                     return;
                 }
 
                 let vol = f64::from_bits(volume_clone.load(Ordering::Relaxed));
                 let is_muted = muted_clone.load(Ordering::Relaxed) != 0;
+                let gain = if is_muted { 0.0 } else { vol as f32 };
 
                 let mut buf = buffer_callback.lock();
                 let available = buf.len().min(data.len());
 
-                if available > 0 {
-                    let gain = if is_muted { 0.0 } else { vol as f32 };
-                    for (out, &inp) in data[..available].iter_mut().zip(buf[..available].iter()) {
-                        *out = inp * gain;
-                    }
-                    buf.drain(..available);
-
-                    // Track samples played for clock
-                    let frames = available as u64 / config::AUDIO_CHANNELS as u64;
-                    samples_played_clone.fetch_add(frames, Ordering::Relaxed);
+                for i in 0..available {
+                    data[i] = buf[i] * gain;
                 }
+                buf.drain(..available); // O(1) for VecDeque head removal
 
-                // Fill remainder with silence
-                for sample in &mut data[available..] {
-                    *sample = 0.0;
-                }
+                for s in &mut data[available..] { *s = 0.0; }
+
+                let frames = available as u64 / config::AUDIO_CHANNELS as u64;
+                samples_played_clone.fetch_add(frames, Ordering::Relaxed);
             },
-            move |err| {
-                log::error!("Audio stream error: {:?}", err);
-            },
+            move |err| { log::error!("Audio stream error: {:?}", err); },
             None,
         )?;
 
@@ -106,11 +92,8 @@ impl AudioOutput {
 
         Ok(Self {
             _stream: stream,
-            volume,
-            muted,
-            samples_played,
-            buffer,
-            paused,
+            volume, muted, samples_played,
+            buffer, paused,
             sample_rate: config::AUDIO_SAMPLE_RATE,
         })
     }
@@ -127,13 +110,9 @@ impl AudioOutput {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
-    /// Clear buffer and reset samples counter (for seek)
     pub fn flush(&self) {
         self.paused.store(true, Ordering::Relaxed);
-        {
-            let mut buf = self.buffer.lock();
-            buf.clear();
-        }
+        { self.buffer.lock().clear(); }
         self.samples_played.store(0, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
     }

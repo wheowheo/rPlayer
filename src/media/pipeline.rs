@@ -43,7 +43,7 @@ impl MediaPipeline {
             .index;
         let audio_stream_index = info.audio.as_ref().map(|a| a.index);
 
-        let (frame_tx, frame_rx) = bounded::<RawFrame>(8);
+        let (frame_tx, frame_rx) = bounded::<RawFrame>(3);
         let (audio_tx, audio_rx) = bounded::<DecodedAudio>(32);
         let (cmd_tx, cmd_rx) = bounded::<PipelineCommand>(16);
         let running = Arc::new(AtomicBool::new(true));
@@ -245,10 +245,13 @@ fn decode_thread(
                             }
                             seek_target_pts = None;
                         }
-                        match frame_tx.try_send(frame) {
+                        // Block briefly if queue full — renderer drains at 60fps
+                        match frame_tx.send_timeout(frame, std::time::Duration::from_millis(50)) {
                             Ok(()) => {}
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {}
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                // Queue stuck — drop this frame to stay responsive to commands
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
                                 return Ok(());
                             }
                         }
@@ -284,7 +287,7 @@ fn decode_thread(
     let _ = video_decoder.send_eof();
     loop {
         match video_decoder.receive_frame() {
-            Ok(Some(frame)) => { let _ = frame_tx.try_send(frame); }
+            Ok(Some(frame)) => { let _ = frame_tx.send_timeout(frame, std::time::Duration::from_millis(50)); }
             _ => break,
         }
     }

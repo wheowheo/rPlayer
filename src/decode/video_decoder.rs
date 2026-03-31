@@ -19,6 +19,8 @@ pub struct VideoDecoder {
     mode: DecodeMode,
     hw_device_ctx: Option<*mut ffmpeg::ffi::AVBufferRef>,
     last_scaler_key: (u32, u32, i32),
+    // Reusable buffers to avoid per-frame allocation
+    plane_bufs: [Vec<u8>; 3],
 }
 
 unsafe impl Send for VideoDecoder {}
@@ -34,6 +36,7 @@ impl VideoDecoder {
             mode: DecodeMode::Software,
             hw_device_ctx: None,
             last_scaler_key: (0, 0, 0),
+            plane_bufs: [Vec::new(), Vec::new(), Vec::new()],
         })
     }
 
@@ -68,6 +71,7 @@ impl VideoDecoder {
                 mode: DecodeMode::Hardware,
                 hw_device_ctx: Some(hw_device_ctx),
                 last_scaler_key: (0, 0, 0),
+                plane_bufs: [Vec::new(), Vec::new(), Vec::new()],
             })
         } else {
             Ok(Self {
@@ -75,6 +79,7 @@ impl VideoDecoder {
                 mode: DecodeMode::Software,
                 hw_device_ctx: None,
                 last_scaler_key: (0, 0, 0),
+                plane_bufs: [Vec::new(), Vec::new(), Vec::new()],
             })
         }
     }
@@ -108,7 +113,6 @@ impl VideoDecoder {
                 let pts = decoded.pts().unwrap_or(0);
                 let pts_secs = pts as f64 * self.time_base;
 
-                // HW frame → system memory
                 let sw_frame = if self.mode == DecodeMode::Hardware {
                     self.transfer_hw_frame(&decoded)?
                 } else {
@@ -119,18 +123,10 @@ impl VideoDecoder {
                 let h = frame_ref.height();
                 let fmt = frame_ref.format();
 
-                // Try zero-copy YUV path
                 match fmt {
-                    Pixel::YUV420P => {
-                        Ok(Some(self.extract_yuv420p(frame_ref, w, h, pts_secs)))
-                    }
-                    Pixel::NV12 => {
-                        Ok(Some(self.extract_nv12(frame_ref, w, h, pts_secs)))
-                    }
-                    _ => {
-                        // Fallback: convert to YUV420P via swscale
-                        Ok(Some(self.convert_to_yuv420p(frame_ref, w, h, pts_secs)?))
-                    }
+                    Pixel::YUV420P => Ok(Some(self.extract_yuv420p(frame_ref, w, h, pts_secs))),
+                    Pixel::NV12 => Ok(Some(self.extract_nv12(frame_ref, w, h, pts_secs))),
+                    _ => Ok(Some(self.convert_to_yuv420p(frame_ref, w, h, pts_secs)?)),
                 }
             }
             Err(ffmpeg::Error::Other { errno: ffmpeg::ffi::EAGAIN }) => Ok(None),
@@ -138,65 +134,80 @@ impl VideoDecoder {
         }
     }
 
-    fn extract_yuv420p(&self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
-        let copy_plane = |idx: usize, pw: u32, ph: u32| {
-            let stride = frame.stride(idx);
-            let data = frame.data(idx);
-            let row_bytes = pw as usize;
-            if stride == row_bytes {
-                PlaneData { data: data[..row_bytes * ph as usize].to_vec(), stride, width: pw, height: ph }
-            } else {
-                let mut packed = Vec::with_capacity(row_bytes * ph as usize);
-                for y in 0..ph as usize {
-                    let s = y * stride;
-                    packed.extend_from_slice(&data[s..s + row_bytes]);
-                }
-                PlaneData { data: packed, stride: row_bytes, width: pw, height: ph }
-            }
-        };
+    /// Extract YUV420P planes — reuses internal buffers to avoid allocation
+    fn extract_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        let sizes = [(w as usize, h as usize), (cw, ch), (cw, ch)];
 
-        let cw = w / 2;
-        let ch = h / 2;
-        RawFrame {
-            format: FrameFormat::Yuv420p,
-            width: w, height: h,
-            planes: vec![
-                copy_plane(0, w, h),
-                copy_plane(1, cw, ch),
-                copy_plane(2, cw, ch),
-            ],
-            pts_secs,
+        let mut planes = Vec::with_capacity(3);
+        for (i, &(pw, ph)) in sizes.iter().enumerate() {
+            let stride = frame.stride(i);
+            let src = frame.data(i);
+
+            let buf = &mut self.plane_bufs[i];
+            let needed = pw * ph;
+            buf.clear();
+            buf.reserve(needed);
+
+            if stride == pw {
+                buf.extend_from_slice(&src[..needed]);
+            } else {
+                for y in 0..ph {
+                    let s = y * stride;
+                    buf.extend_from_slice(&src[s..s + pw]);
+                }
+            }
+
+            planes.push(PlaneData {
+                data: std::mem::take(buf), // move out, will be returned via channel
+                stride: pw,
+                width: pw as u32,
+                height: ph as u32,
+            });
         }
+
+        RawFrame { format: FrameFormat::Yuv420p, width: w, height: h, planes, pts_secs }
     }
 
-    fn extract_nv12(&self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
-        let copy_plane = |idx: usize, pw: u32, ph: u32, bpp: usize| {
-            let stride = frame.stride(idx);
-            let data = frame.data(idx);
-            let row_bytes = pw as usize * bpp;
-            if stride == row_bytes {
-                PlaneData { data: data[..row_bytes * ph as usize].to_vec(), stride, width: pw, height: ph }
-            } else {
-                let mut packed = Vec::with_capacity(row_bytes * ph as usize);
-                for y in 0..ph as usize {
-                    let s = y * stride;
-                    packed.extend_from_slice(&data[s..s + row_bytes]);
-                }
-                PlaneData { data: packed, stride: row_bytes, width: pw, height: ph }
-            }
-        };
+    fn extract_nv12(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        // Y plane: w x h, 1 bpp.  UV plane: cw x ch, 2 bpp.
+        let plane_specs: [(usize, usize, usize); 2] = [
+            (w as usize, h as usize, 1),
+            (cw, ch, 2),
+        ];
 
-        let cw = w / 2;
-        let ch = h / 2;
-        RawFrame {
-            format: FrameFormat::Nv12,
-            width: w, height: h,
-            planes: vec![
-                copy_plane(0, w, h, 1),
-                copy_plane(1, cw, ch, 2),
-            ],
-            pts_secs,
+        let mut planes = Vec::with_capacity(2);
+        for (i, &(pw, ph, bpp)) in plane_specs.iter().enumerate() {
+            let stride = frame.stride(i);
+            let src = frame.data(i);
+            let row_bytes = pw * bpp;
+
+            let buf = &mut self.plane_bufs[i];
+            let needed = row_bytes * ph;
+            buf.clear();
+            buf.reserve(needed);
+
+            if stride == row_bytes {
+                buf.extend_from_slice(&src[..needed]);
+            } else {
+                for y in 0..ph {
+                    let s = y * stride;
+                    buf.extend_from_slice(&src[s..s + row_bytes]);
+                }
+            }
+
+            planes.push(PlaneData {
+                data: std::mem::take(buf),
+                stride: row_bytes,
+                width: pw as u32,
+                height: ph as u32,
+            });
         }
+
+        RawFrame { format: FrameFormat::Nv12, width: w, height: h, planes, pts_secs }
     }
 
     fn convert_to_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> Result<RawFrame, ffmpeg::Error> {
@@ -204,9 +215,7 @@ impl VideoDecoder {
         let key = (w, h, fmt as i32);
         if self.scaler.is_none() || self.last_scaler_key != key {
             self.scaler = Some(sws_context::Context::get(
-                fmt, w, h,
-                Pixel::YUV420P, w, h,
-                flag::Flags::FAST_BILINEAR,
+                fmt, w, h, Pixel::YUV420P, w, h, flag::Flags::FAST_BILINEAR,
             )?);
             self.last_scaler_key = key;
         }
@@ -223,9 +232,7 @@ impl VideoDecoder {
             }
             let mut sw_frame = Video::empty();
             let ret = ffmpeg::ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_ptr, 0);
-            if ret < 0 {
-                return Ok(None);
-            }
+            if ret < 0 { return Ok(None); }
             (*sw_frame.as_mut_ptr()).pts = (*hw_ptr).pts;
             Ok(Some(sw_frame))
         }
