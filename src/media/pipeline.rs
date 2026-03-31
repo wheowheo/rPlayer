@@ -8,7 +8,8 @@ use ffmpeg::codec::packet::Packet;
 
 use crate::decode::audio_decoder::{AudioDecoder, DecodedAudio};
 use crate::decode::demuxer::{self, DemuxerInfo};
-use crate::decode::video_decoder::{DecodeMode, DecodedFrame, VideoDecoder};
+use crate::decode::video_decoder::{DecodeMode, VideoDecoder};
+use crate::video::renderer::RawFrame;
 
 pub enum PipelineCommand {
     Stop,
@@ -24,7 +25,7 @@ const MODE_HW: u8 = 1;
 
 pub struct MediaPipeline {
     pub info: DemuxerInfo,
-    pub frame_rx: Receiver<DecodedFrame>,
+    pub frame_rx: Receiver<RawFrame>,
     pub audio_rx: Option<Receiver<DecodedAudio>>,
     pub cmd_tx: Sender<PipelineCommand>,
     running: Arc<AtomicBool>,
@@ -42,7 +43,7 @@ impl MediaPipeline {
             .index;
         let audio_stream_index = info.audio.as_ref().map(|a| a.index);
 
-        let (frame_tx, frame_rx) = bounded::<DecodedFrame>(8);
+        let (frame_tx, frame_rx) = bounded::<RawFrame>(8);
         let (audio_tx, audio_rx) = bounded::<DecodedAudio>(32);
         let (cmd_tx, cmd_rx) = bounded::<PipelineCommand>(16);
         let running = Arc::new(AtomicBool::new(true));
@@ -99,7 +100,7 @@ fn decode_thread(
     video_stream_index: usize,
     audio_stream_index: Option<usize>,
     initial_hw: bool,
-    frame_tx: Sender<DecodedFrame>,
+    frame_tx: Sender<RawFrame>,
     audio_tx: Sender<DecodedAudio>,
     cmd_rx: Receiver<PipelineCommand>,
     running: Arc<AtomicBool>,
@@ -155,8 +156,11 @@ fn decode_thread(
                             adec.flush();
                         }
                         seek_target_pts = Some(target);
-                        while frame_tx.try_send(DecodedFrame {
-                            width: 1, height: 1, data: vec![0; 4], pts_secs: -1.0,
+                        while frame_tx.try_send(RawFrame {
+                            format: crate::video::renderer::FrameFormat::Yuv420p,
+                            width: 2, height: 2,
+                            planes: vec![],
+                            pts_secs: -1.0,
                         }).is_ok() {}
                         while audio_tx.try_send(DecodedAudio {
                             data: Vec::new(), pts_secs: -1.0,

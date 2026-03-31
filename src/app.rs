@@ -4,11 +4,11 @@ use winit::window::Window;
 
 use crate::audio::output::AudioOutput;
 use crate::config;
-use crate::decode::video_decoder::{DecodeMode, DecodedFrame};
+use crate::decode::video_decoder::DecodeMode;
 use crate::media::clock::Clock;
 use crate::media::pipeline::{MediaPipeline, PipelineCommand};
 use crate::subtitle::SubtitleTrack;
-use crate::video::renderer::VideoRenderer;
+use crate::video::renderer::{RawFrame, VideoRenderer};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackState {
@@ -36,6 +36,7 @@ pub enum UiAction {
     SpeedDown,
     ToggleDecoder,
     ToggleInfoOverlay,
+    SeekTo(f64),
 }
 
 pub struct UiState {
@@ -75,7 +76,7 @@ pub struct App {
     pub pipeline: Option<MediaPipeline>,
     pub audio_output: Option<AudioOutput>,
     pub clock: Option<Clock>,
-    pub pending_frame: Option<DecodedFrame>,
+    pub pending_frame: Option<RawFrame>,
     video_fps: f64,
 
     // Subtitle
@@ -174,8 +175,13 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     .show_value(false)
                     .trailing_fill(true)
             );
-            if resp.changed() {
+            if resp.dragged() {
+                // Show target time while dragging, but don't seek yet
                 state.current_time = seek_pos as f64;
+            }
+            if resp.drag_stopped() {
+                // Seek only when user releases the slider
+                actions.push(UiAction::SeekTo(seek_pos as f64));
             }
         }
 
@@ -642,10 +648,7 @@ impl App {
             if diff < -frame_duration * 2.0 {
                 frames_dropped += 1;
                 if frames_dropped > 30 {
-                    self.video_renderer.upload_rgba_frame(
-                        &self.device, &self.queue,
-                        frame.width, frame.height, &frame.data,
-                    );
+                    self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
                     break;
                 }
                 continue;
@@ -653,10 +656,7 @@ impl App {
                 self.pending_frame = Some(frame);
                 break;
             } else {
-                self.video_renderer.upload_rgba_frame(
-                    &self.device, &self.queue,
-                    frame.width, frame.height, &frame.data,
-                );
+                self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
                 break;
             }
         }
@@ -724,6 +724,9 @@ impl App {
             }
             UiAction::SeekBackward => {
                 self.seek(self.ui_state.current_time - config::SEEK_STEP_SECS);
+            }
+            UiAction::SeekTo(target) => {
+                self.seek(*target);
             }
             UiAction::VolumeUp => {
                 self.ui_state.volume = (self.ui_state.volume + config::VOLUME_STEP).min(config::MAX_VOLUME);
