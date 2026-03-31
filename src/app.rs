@@ -8,6 +8,7 @@ use crate::config;
 use crate::decode::video_decoder::DecodedFrame;
 use crate::media::clock::Clock;
 use crate::media::pipeline::MediaPipeline;
+use crate::subtitle::SubtitleTrack;
 use crate::video::renderer::VideoRenderer;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,6 +28,8 @@ pub struct UiState {
     pub current_time: f64,
     pub duration: f64,
     pub video_info: String,
+    pub show_info_overlay: bool,
+    pub subtitle_text: String,
 }
 
 pub struct App {
@@ -54,12 +57,16 @@ pub struct App {
     pub pending_frame: Option<DecodedFrame>,
     video_fps: f64,
 
+    // Subtitle
+    pub subtitle: Option<SubtitleTrack>,
+
     // Window
     pub window: Arc<Window>,
     pub video_size: Option<(u32, u32)>,
 }
 
 fn draw_ui(ctx: &egui::Context, state: &UiState) {
+    // Status bar at bottom
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             let state_text = match state.playback_state {
@@ -94,6 +101,48 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             }
         });
     });
+
+    // Info overlay (Tab)
+    if state.show_info_overlay {
+        egui::Area::new(egui::Id::new("info_overlay"))
+            .fixed_pos(egui::pos2(10.0, 10.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(&state.video_info).monospace().size(14.0));
+                    ui.label(egui::RichText::new(
+                        format!("시간: {} / {}", format_time(state.current_time), format_time(state.duration))
+                    ).monospace().size(14.0));
+                    ui.label(egui::RichText::new(
+                        format!("배속: {:.2}x | 볼륨: {:.0}%{}",
+                            state.speed,
+                            state.volume * 100.0,
+                            if state.muted { " (음소거)" } else { "" }
+                        )
+                    ).monospace().size(14.0));
+                });
+            });
+    }
+
+    // Subtitle overlay
+    if !state.subtitle_text.is_empty() {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("subtitle"))
+            .fixed_pos(egui::pos2(screen.center().x, screen.max.y - 80.0))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 180))
+                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&state.subtitle_text)
+                                .color(egui::Color32::WHITE)
+                                .size(20.0)
+                        );
+                    });
+            });
+    }
 }
 
 fn format_time(secs: f64) -> String {
@@ -191,12 +240,15 @@ impl App {
                 current_time: 0.0,
                 duration: 0.0,
                 video_info: String::new(),
+                show_info_overlay: false,
+                subtitle_text: String::new(),
             },
             pipeline: None,
             audio_output: None,
             clock: None,
             pending_frame: None,
             video_fps: 0.0,
+            subtitle: None,
             window,
             video_size: None,
         })
@@ -255,9 +307,26 @@ impl App {
                 self.pipeline = Some(pipeline);
                 self.ui_state.playback_state = PlaybackState::Playing;
                 self.ui_state.current_time = 0.0;
+                self.ui_state.subtitle_text.clear();
                 self.pending_frame = None;
 
-                let file_name = std::path::Path::new(path)
+                // Auto-detect subtitle file (same name, .srt or .smi)
+                let path_base = std::path::Path::new(path);
+                let stem = path_base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let dir = path_base.parent().unwrap_or(std::path::Path::new("."));
+                self.subtitle = None;
+                for ext in &["srt", "smi", "sami"] {
+                    let sub_path = dir.join(format!("{}.{}", stem, ext));
+                    if sub_path.exists() {
+                        if let Some(track) = SubtitleTrack::load_file(&sub_path.to_string_lossy()) {
+                            log::info!("Subtitle loaded: {:?}", sub_path);
+                            self.subtitle = Some(track);
+                            break;
+                        }
+                    }
+                }
+
+                let file_name = path_base
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(path);
@@ -324,6 +393,15 @@ impl App {
                     &frame.data,
                 );
                 break;
+            }
+        }
+
+        // Update subtitle
+        if let Some(ref subtitle) = self.subtitle {
+            if let Some(text) = subtitle.current_text(clock_time) {
+                self.ui_state.subtitle_text = text.to_string();
+            } else {
+                self.ui_state.subtitle_text.clear();
             }
         }
     }

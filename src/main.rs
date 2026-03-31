@@ -177,6 +177,21 @@ impl ApplicationHandler for RPlayer {
                                 audio.set_muted(app.ui_state.muted);
                             }
                         }
+                        PhysicalKey::Code(KeyCode::Tab) => {
+                            app.ui_state.show_info_overlay = !app.ui_state.show_info_overlay;
+                        }
+                        PhysicalKey::Code(KeyCode::Equal) => {
+                            // + key: subtitle sync forward
+                            if let Some(ref mut sub) = app.subtitle {
+                                sub.adjust_sync(0.5);
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::Minus) => {
+                            // - key: subtitle sync backward
+                            if let Some(ref mut sub) = app.subtitle {
+                                sub.adjust_sync(-0.5);
+                            }
+                        }
                         _ => {}
                     }
                 }
