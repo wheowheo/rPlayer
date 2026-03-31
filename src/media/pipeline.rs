@@ -118,9 +118,14 @@ fn decode_thread(
                             adec.flush();
                         }
                         seek_target_pts = Some(target);
-                        // Drain channels
+                        // Drain frame channel (consume and discard existing frames)
                         while frame_tx.try_send(DecodedFrame {
-                            width: 0, height: 0, data: Vec::new(), pts_secs: -1.0,
+                            width: 1, height: 1, data: vec![0; 4], pts_secs: -1.0,
+                        }).is_ok() {}
+                        // Drain audio channel
+                        while audio_tx.try_send(DecodedAudio {
+                            data: Vec::new(), pts_secs: -1.0,
+                            sample_rate: 0, channels: 0,
                         }).is_ok() {}
                     }
                     if paused {
@@ -165,7 +170,16 @@ fn decode_thread(
                             }
                             seek_target_pts = None;
                         }
-                        if frame_tx.send(frame).is_err() { return Ok(()); }
+                        // Non-blocking send: drop frame if queue full (prefer audio continuity)
+                        match frame_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                // Video queue full — drop this frame to keep audio flowing
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                return Ok(());
+                            }
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => break,
@@ -200,7 +214,7 @@ fn decode_thread(
     loop {
         match video_decoder.receive_frame() {
             Ok(Some(frame)) => {
-                if frame_tx.send(frame).is_err() { return Ok(()); }
+                let _ = frame_tx.try_send(frame);
             }
             _ => break,
         }

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Receiver;
@@ -9,9 +9,11 @@ use crate::decode::audio_decoder::DecodedAudio;
 
 pub struct AudioOutput {
     _stream: cpal::Stream,
-    volume: Arc<AtomicU64>,    // f64 bits stored as u64
-    muted: Arc<AtomicU64>,     // 0 or 1
+    volume: Arc<AtomicU64>,
+    muted: Arc<AtomicU64>,
     samples_played: Arc<AtomicU64>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    paused: Arc<AtomicBool>,
     sample_rate: u32,
 }
 
@@ -31,16 +33,18 @@ impl AudioOutput {
 
         let volume = Arc::new(AtomicU64::new(f64::to_bits(1.0)));
         let muted = Arc::new(AtomicU64::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
 
         let volume_clone = volume.clone();
         let muted_clone = muted.clone();
         let samples_played_clone = samples_played.clone();
+        let paused_clone = paused.clone();
 
-        // Buffer for audio data consumed by the callback
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
             config::AUDIO_RING_BUFFER_SIZE,
         )));
         let buffer_clone = buffer.clone();
+        let buffer_callback = buffer.clone();
 
         // Feed thread: moves decoded audio from channel to buffer
         std::thread::Builder::new()
@@ -48,23 +52,30 @@ impl AudioOutput {
             .spawn(move || {
                 while let Ok(audio) = audio_rx.recv() {
                     let mut buf = buffer_clone.lock();
-                    buf.extend_from_slice(&audio.data);
-                    // Limit buffer to prevent unbounded growth
-                    let max_samples = config::AUDIO_RING_BUFFER_SIZE;
-                    if buf.len() > max_samples * 2 {
-                        let drain = buf.len() - max_samples;
-                        buf.drain(..drain);
+                    // Cap buffer at a reasonable size to prevent unbounded growth
+                    // But DON'T drain old data — let backpressure handle it
+                    if buf.len() < config::AUDIO_RING_BUFFER_SIZE * 2 {
+                        buf.extend_from_slice(&audio.data);
                     }
+                    // If buffer is full, drop this packet (preferable to dropping played data)
                 }
             })?;
 
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let is_paused = paused_clone.load(Ordering::Relaxed);
+                if is_paused {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
+                    return;
+                }
+
                 let vol = f64::from_bits(volume_clone.load(Ordering::Relaxed));
                 let is_muted = muted_clone.load(Ordering::Relaxed) != 0;
 
-                let mut buf = buffer.lock();
+                let mut buf = buffer_callback.lock();
                 let available = buf.len().min(data.len());
 
                 if available > 0 {
@@ -97,6 +108,8 @@ impl AudioOutput {
             volume,
             muted,
             samples_played,
+            buffer,
+            paused,
             sample_rate: config::AUDIO_SAMPLE_RATE,
         })
     }
@@ -107,6 +120,21 @@ impl AudioOutput {
 
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(if muted { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Clear buffer and reset samples counter (for seek)
+    pub fn flush(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        {
+            let mut buf = self.buffer.lock();
+            buf.clear();
+        }
+        self.samples_played.store(0, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     pub fn samples_played(&self) -> u64 {

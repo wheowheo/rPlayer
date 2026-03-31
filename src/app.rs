@@ -291,7 +291,7 @@ impl App {
                             audio.set_volume(self.ui_state.volume);
                             audio.set_muted(self.ui_state.muted);
                             self.audio_output = Some(audio);
-                            self.clock = Some(Clock::new(samples_played));
+                            self.clock = Some(Clock::new(samples_played, crate::config::AUDIO_SAMPLE_RATE));
                             log::info!("Audio output started");
                         }
                         Err(e) => {
@@ -358,8 +358,8 @@ impl App {
         };
 
         // Try to get a frame to display
+        let mut frames_dropped = 0u32;
         loop {
-            // Use pending frame first, or try to receive a new one
             let frame = if self.pending_frame.is_some() {
                 self.pending_frame.take().unwrap()
             } else {
@@ -374,10 +374,24 @@ impl App {
                 }
             };
 
+            // Skip sentinel frames (from seek drain)
+            if frame.pts_secs < 0.0 {
+                continue;
+            }
+
             let diff = frame.pts_secs - clock_time;
 
-            if diff < -frame_duration {
+            if diff < -frame_duration * 2.0 {
                 // Frame is late — drop it and try next
+                frames_dropped += 1;
+                if frames_dropped > 30 {
+                    // Too many drops — just show something
+                    self.video_renderer.upload_rgba_frame(
+                        &self.device, &self.queue,
+                        frame.width, frame.height, &frame.data,
+                    );
+                    break;
+                }
                 continue;
             } else if diff > config::SYNC_THRESHOLD_SECS {
                 // Frame is early — save for next render cycle
@@ -386,14 +400,14 @@ impl App {
             } else {
                 // Display this frame
                 self.video_renderer.upload_rgba_frame(
-                    &self.device,
-                    &self.queue,
-                    frame.width,
-                    frame.height,
-                    &frame.data,
+                    &self.device, &self.queue,
+                    frame.width, frame.height, &frame.data,
                 );
                 break;
             }
+        }
+        if frames_dropped > 0 {
+            log::debug!("Dropped {} late frames (clock={:.3})", frames_dropped, clock_time);
         }
 
         // Update subtitle
@@ -404,6 +418,23 @@ impl App {
                 self.ui_state.subtitle_text.clear();
             }
         }
+    }
+
+    pub fn seek(&mut self, target: f64) {
+        let target = target.clamp(0.0, self.ui_state.duration);
+        if let Some(p) = &self.pipeline {
+            let _ = p.cmd_tx.send(crate::media::pipeline::PipelineCommand::Seek(target));
+        }
+        // Flush audio buffer and reset clock
+        if let Some(ref audio) = self.audio_output {
+            audio.flush();
+        }
+        if let Some(ref mut clock) = self.clock {
+            clock.reset_for_seek(target);
+        }
+        self.pending_frame = None;
+        self.ui_state.current_time = target;
+        log::debug!("Seek to {:.2}s", target);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

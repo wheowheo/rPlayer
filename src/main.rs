@@ -105,11 +105,17 @@ impl ApplicationHandler for RPlayer {
                                     if let Some(p) = &app.pipeline {
                                         let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Pause);
                                     }
+                                    if let Some(ref audio) = app.audio_output {
+                                        audio.set_paused(true);
+                                    }
                                 }
                                 app::PlaybackState::Paused => {
                                     app.ui_state.playback_state = app::PlaybackState::Playing;
                                     if let Some(p) = &app.pipeline {
                                         let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Resume);
+                                    }
+                                    if let Some(ref audio) = app.audio_output {
+                                        audio.set_paused(false);
                                     }
                                 }
                                 _ => {}
@@ -139,25 +145,12 @@ impl ApplicationHandler for RPlayer {
                             }
                         }
                         PhysicalKey::Code(KeyCode::ArrowRight) => {
-                            let target = (app.ui_state.current_time + config::SEEK_STEP_SECS)
-                                .min(app.ui_state.duration);
-                            if let Some(p) = &app.pipeline {
-                                let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Seek(target));
-                            }
-                            app.pending_frame = None;
-                            if let Some(ref mut clock) = app.clock {
-                                clock.reset();
-                            }
+                            let target = app.ui_state.current_time + config::SEEK_STEP_SECS;
+                            app.seek(target);
                         }
                         PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                            let target = (app.ui_state.current_time - config::SEEK_STEP_SECS).max(0.0);
-                            if let Some(p) = &app.pipeline {
-                                let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Seek(target));
-                            }
-                            app.pending_frame = None;
-                            if let Some(ref mut clock) = app.clock {
-                                clock.reset();
-                            }
+                            let target = app.ui_state.current_time - config::SEEK_STEP_SECS;
+                            app.seek(target);
                         }
                         PhysicalKey::Code(KeyCode::BracketRight) => {
                             app.ui_state.speed = (app.ui_state.speed + config::SPEED_STEP).min(config::MAX_SPEED);
