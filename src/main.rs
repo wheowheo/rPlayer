@@ -24,11 +24,16 @@ use app::App;
 
 struct RPlayer {
     app: Option<App>,
+    pending_file: Option<String>,
 }
 
 impl RPlayer {
     fn new() -> Self {
-        Self { app: None }
+        let file = std::env::args().nth(1);
+        Self {
+            app: None,
+            pending_file: file,
+        }
     }
 }
 
@@ -47,8 +52,13 @@ impl ApplicationHandler for RPlayer {
 
         let window = Arc::new(event_loop.create_window(window_attrs).expect("Failed to create window"));
 
-        let app = pollster::block_on(App::new(window.clone()))
+        let mut app = pollster::block_on(App::new(window.clone()))
             .expect("Failed to initialize app");
+
+        // Open file from command line argument
+        if let Some(path) = self.pending_file.take() {
+            app.open_file(&path);
+        }
 
         self.app = Some(app);
     }
@@ -61,7 +71,6 @@ impl ApplicationHandler for RPlayer {
     ) {
         let Some(app) = self.app.as_mut() else { return };
 
-        // Let egui handle the event first
         let response = app.egui_state.on_window_event(&app.window, &event);
         if response.consumed {
             return;
@@ -69,6 +78,9 @@ impl ApplicationHandler for RPlayer {
 
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(pipeline) = app.pipeline.take() {
+                    pipeline.stop();
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -79,22 +91,38 @@ impl ApplicationHandler for RPlayer {
                 if event.state.is_pressed() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyO) => {
-                            log::info!("Open file dialog (TODO)");
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Video", &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v"])
+                                .pick_file()
+                            {
+                                app.open_file(&path.to_string_lossy());
+                            }
                         }
                         PhysicalKey::Code(KeyCode::Space) => {
                             match app.ui_state.playback_state {
                                 app::PlaybackState::Playing => {
                                     app.ui_state.playback_state = app::PlaybackState::Paused;
+                                    if let Some(p) = &app.pipeline {
+                                        let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Pause);
+                                    }
                                 }
                                 app::PlaybackState::Paused => {
                                     app.ui_state.playback_state = app::PlaybackState::Playing;
+                                    if let Some(p) = &app.pipeline {
+                                        let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Resume);
+                                    }
                                 }
                                 _ => {}
                             }
                         }
                         PhysicalKey::Code(KeyCode::Escape) => {
                             if app.ui_state.playback_state != app::PlaybackState::Empty {
+                                if let Some(pipeline) = app.pipeline.take() {
+                                    pipeline.stop();
+                                }
                                 app.ui_state.playback_state = app::PlaybackState::Stopped;
+                                app.ui_state.current_time = 0.0;
+                                app.window.set_title(config::APP_NAME);
                             }
                         }
                         PhysicalKey::Code(KeyCode::ArrowUp) => {
@@ -118,10 +146,11 @@ impl ApplicationHandler for RPlayer {
                 app.window.request_redraw();
             }
             WindowEvent::DroppedFile(path) => {
-                log::info!("File dropped: {:?}", path);
-                // TODO: open file
+                app.open_file(&path.to_string_lossy());
             }
             WindowEvent::RedrawRequested => {
+                app.update_frame();
+
                 match app.render() {
                     Ok(_) => {}
                     Err(wgpu::SurfaceError::Lost) => app.resize(
@@ -132,7 +161,6 @@ impl ApplicationHandler for RPlayer {
                     Err(e) => log::error!("Render error: {:?}", e),
                 }
 
-                // Keep requesting redraws when playing
                 if app.ui_state.playback_state == app::PlaybackState::Playing {
                     app.window.request_redraw();
                 }

@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 use winit::window::Window;
 
 use crate::config;
+use crate::decode::video_decoder::DecodedFrame;
+use crate::media::pipeline::{MediaPipeline, PipelineCommand};
 use crate::video::renderer::VideoRenderer;
 
-/// Playback state machine
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackState {
     Empty,
@@ -14,15 +16,16 @@ pub enum PlaybackState {
     Buffering,
 }
 
-/// UI-only state for draw_ui (avoids borrow conflicts)
 pub struct UiState {
     pub playback_state: PlaybackState,
     pub volume: f64,
     pub speed: f64,
     pub muted: bool,
+    pub current_time: f64,
+    pub duration: f64,
+    pub video_info: String,
 }
 
-/// Main application state
 pub struct App {
     // GPU
     pub device: Arc<wgpu::Device>,
@@ -41,6 +44,11 @@ pub struct App {
     // State
     pub ui_state: UiState,
 
+    // Media
+    pub pipeline: Option<MediaPipeline>,
+    last_frame_time: Option<Instant>,
+    last_pts: f64,
+
     // Window
     pub window: Arc<Window>,
     pub video_size: Option<(u32, u32)>,
@@ -58,6 +66,14 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             };
             ui.label(state_text);
             ui.separator();
+
+            if state.duration > 0.0 {
+                let cur = format_time(state.current_time);
+                let dur = format_time(state.duration);
+                ui.label(format!("{cur} / {dur}"));
+                ui.separator();
+            }
+
             let vol_text = if state.muted {
                 "음소거".to_string()
             } else {
@@ -66,8 +82,25 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             ui.label(vol_text);
             ui.separator();
             ui.label(format!("배속: {:.2}x", state.speed));
+
+            if !state.video_info.is_empty() {
+                ui.separator();
+                ui.label(&state.video_info);
+            }
         });
     });
+}
+
+fn format_time(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 impl App {
@@ -150,10 +183,96 @@ impl App {
                 volume: 1.0,
                 speed: 1.0,
                 muted: false,
+                current_time: 0.0,
+                duration: 0.0,
+                video_info: String::new(),
             },
+            pipeline: None,
+            last_frame_time: None,
+            last_pts: 0.0,
             window,
             video_size: None,
         })
+    }
+
+    pub fn open_file(&mut self, path: &str) {
+        // Stop existing pipeline
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.stop();
+        }
+
+        match MediaPipeline::open(path) {
+            Ok(pipeline) => {
+                let info = &pipeline.info;
+                self.ui_state.duration = info.duration_secs;
+                self.video_size = Some((info.video_width, info.video_height));
+
+                let codec = info.video.as_ref()
+                    .map(|v| v.codec_name.as_str())
+                    .unwrap_or("?");
+                self.ui_state.video_info = format!(
+                    "{}x{} {} {:.1}fps",
+                    info.video_width, info.video_height, codec, info.video_fps
+                );
+
+                // Resize window to video aspect ratio
+                if info.video_width > 0 && info.video_height > 0 {
+                    let scale = (config::DEFAULT_HEIGHT as f64) / (info.video_height as f64);
+                    let w = (info.video_width as f64 * scale) as u32;
+                    let h = config::DEFAULT_HEIGHT;
+                    let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+                }
+
+                self.pipeline = Some(pipeline);
+                self.ui_state.playback_state = PlaybackState::Playing;
+                self.ui_state.current_time = 0.0;
+                self.last_frame_time = None;
+                self.last_pts = 0.0;
+
+                let file_name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path);
+                self.window.set_title(&format!("{} - {}", file_name, config::APP_NAME));
+
+                log::info!("Opened: {} ({})", path, self.ui_state.video_info);
+            }
+            Err(e) => {
+                log::error!("Failed to open {}: {}", path, e);
+            }
+        }
+    }
+
+    pub fn update_frame(&mut self) {
+        if self.ui_state.playback_state != PlaybackState::Playing {
+            return;
+        }
+
+        let Some(pipeline) = &self.pipeline else { return };
+
+        // Try to receive a decoded frame (non-blocking)
+        match pipeline.frame_rx.try_recv() {
+            Ok(frame) => {
+                self.ui_state.current_time = frame.pts_secs;
+                self.last_pts = frame.pts_secs;
+
+                self.video_renderer.upload_rgba_frame(
+                    &self.device,
+                    &self.queue,
+                    frame.width,
+                    frame.height,
+                    &frame.data,
+                );
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                // No frame ready yet, keep displaying previous
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // Pipeline finished
+                self.ui_state.playback_state = PlaybackState::Stopped;
+                log::info!("Playback finished");
+            }
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
