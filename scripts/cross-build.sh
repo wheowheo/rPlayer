@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# --- 설정 ---
 APP_NAME="rplayer"
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+OS="$(uname -s)"
+ARCH="$(uname -m)"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m' B='\033[0;34m' NC='\033[0m'
 info()  { echo -e "${B}[INFO]${NC} $*"; }
@@ -14,99 +15,51 @@ ok()    { echo -e "${G}[OK]${NC} $*"; }
 warn()  { echo -e "${Y}[WARN]${NC} $*"; }
 err()   { echo -e "${R}[ERROR]${NC} $*"; exit 1; }
 
-TARGETS=("${@}")
-if [ ${#TARGETS[@]} -eq 0 ]; then
-    echo "사용법: $0 <target...>"
-    echo ""
-    echo "지원 타겟:"
-    echo "  macos-arm64      aarch64-apple-darwin"
-    echo "  macos-x64        x86_64-apple-darwin"
-    echo "  macos-universal   위 두 개 합쳐서 Universal Binary"
-    echo "  windows-x64      x86_64-pc-windows-msvc (네이티브 전용)"
-    echo "  linux-x64        x86_64-unknown-linux-gnu (cross 필요)"
-    echo ""
-    echo "예: $0 macos-arm64 macos-x64 macos-universal"
-    exit 0
-fi
+echo "========================================="
+echo " rPlayer 빌드 스크립트"
+echo " 현재 환경: $OS $ARCH"
+echo "========================================="
+echo ""
 
-mkdir -p dist
+case "$OS" in
+    Darwin)
+        info "macOS 네이티브 빌드"
+        bash scripts/build.sh release
+        echo ""
 
-build_target() {
-    local TRIPLE="$1"
-    local LABEL="$2"
-
-    info "빌드: $LABEL ($TRIPLE)"
-
-    # 타겟 설치 확인
-    if ! rustup target list --installed | grep -q "$TRIPLE"; then
-        info "타겟 추가: $TRIPLE"
-        rustup target add "$TRIPLE"
-    fi
-
-    cargo build --release --target "$TRIPLE"
-
-    local BIN="target/$TRIPLE/release/$APP_NAME"
-    if [ ! -f "$BIN" ]; then
-        warn "$LABEL 빌드 실패"
-        return 1
-    fi
-
-    local SIZE=$(du -h "$BIN" | cut -f1)
-    ok "$LABEL 완료 ($SIZE)"
-}
-
-for TARGET in "${TARGETS[@]}"; do
-    case "$TARGET" in
-        macos-arm64)
-            build_target "aarch64-apple-darwin" "macOS ARM64"
-            ;;
-        macos-x64)
-            build_target "x86_64-apple-darwin" "macOS x86_64"
-            ;;
-        macos-universal)
-            # 두 아키텍처 빌드 후 lipo로 합침
-            build_target "aarch64-apple-darwin" "macOS ARM64"
-            build_target "x86_64-apple-darwin" "macOS x86_64"
-
-            info "Universal Binary 생성 중..."
-            UNIVERSAL_DIR="dist/${APP_NAME}-${VERSION}-macos-universal"
-            mkdir -p "$UNIVERSAL_DIR"
-            lipo -create \
-                "target/aarch64-apple-darwin/release/$APP_NAME" \
-                "target/x86_64-apple-darwin/release/$APP_NAME" \
-                -output "$UNIVERSAL_DIR/$APP_NAME"
-
-            local SIZE=$(du -h "$UNIVERSAL_DIR/$APP_NAME" | cut -f1)
-            ok "Universal Binary: $UNIVERSAL_DIR/$APP_NAME ($SIZE)"
-
-            file "$UNIVERSAL_DIR/$APP_NAME"
-            ;;
-        windows-x64)
-            if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
-                build_target "x86_64-pc-windows-msvc" "Windows x64"
-            else
-                warn "Windows 타겟은 Windows에서만 빌드할 수 있습니다 (MSVC 링커 필요)."
-                warn "대안: GitHub Actions CI를 사용하세요."
-            fi
-            ;;
-        linux-x64)
-            if [[ "$(uname -s)" == "Linux" ]]; then
-                build_target "x86_64-unknown-linux-gnu" "Linux x64"
-            else
-                warn "Linux 타겟은 Linux에서 빌드하거나 cross를 사용하세요."
-                if command -v cross &>/dev/null; then
-                    info "cross로 빌드 시도..."
-                    cross build --release --target x86_64-unknown-linux-gnu
-                else
-                    warn "cross가 설치되어 있지 않습니다. cargo install cross"
-                fi
-            fi
-            ;;
-        *)
-            warn "알 수 없는 타겟: $TARGET"
-            ;;
-    esac
-done
+        # Universal Binary는 CI에서만 가능 (두 아키텍처의 FFmpeg 필요)
+        warn "Universal Binary (ARM64+x64)는 GitHub Actions CI에서 생성됩니다."
+        warn "  git tag v${VERSION} && git push origin v${VERSION}"
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        info "Windows 네이티브 빌드"
+        if [ -z "${FFMPEG_DIR:-}" ]; then
+            warn "FFMPEG_DIR 환경변수를 설정하세요."
+            warn "  예: set FFMPEG_DIR=C:\\ffmpeg"
+            err "FFmpeg dev 패키지가 필요합니다."
+        fi
+        bash scripts/build.sh release
+        ;;
+    Linux)
+        info "Linux 네이티브 빌드"
+        if ! pkg-config --exists libavcodec 2>/dev/null; then
+            err "FFmpeg dev 패키지를 설치하세요: sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev"
+        fi
+        bash scripts/build.sh release
+        ;;
+    *)
+        err "지원하지 않는 OS: $OS"
+        ;;
+esac
 
 echo ""
-ok "크로스 빌드 완료"
+echo "========================================="
+echo " 크로스플랫폼 배포는 GitHub Actions 사용"
+echo ""
+echo " 릴리스 방법:"
+echo "   git tag v${VERSION}"
+echo "   git push origin v${VERSION}"
+echo ""
+echo " CI가 자동으로 macOS/Windows/Linux 빌드 후"
+echo " GitHub Releases에 업로드합니다."
+echo "========================================="
