@@ -173,20 +173,51 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
 
     // ========== Bottom control bar ==========
     egui::TopBottomPanel::bottom("control_bar").show(ctx, |ui| {
+        // Seek bar — full-width custom bar
         if state.duration > 0.0 {
-            let mut seek_pos = state.current_time as f32;
-            let resp = ui.add(
-                egui::Slider::new(&mut seek_pos, 0.0..=state.duration as f32)
-                    .show_value(false)
-                    .trailing_fill(true)
+            let progress = (state.current_time / state.duration).clamp(0.0, 1.0) as f32;
+            let bar_height = 12.0;
+            let available = ui.available_width();
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(available, bar_height),
+                egui::Sense::click_and_drag(),
             );
-            if resp.dragged() {
-                // Show target time while dragging, but don't seek yet
-                state.current_time = seek_pos as f64;
+
+            // Draw background
+            ui.painter().rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_gray(60),
+            );
+            // Draw filled portion
+            let filled_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.min.x + rect.width() * progress, rect.max.y),
+            );
+            ui.painter().rect_filled(
+                filled_rect,
+                2.0,
+                egui::Color32::from_rgb(80, 160, 255),
+            );
+
+            // Handle click / drag
+            if resp.dragged() || resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let ratio = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                    state.current_time = ratio as f64 * state.duration;
+                }
             }
-            if resp.drag_stopped() {
-                // Seek only when user releases the slider
-                actions.push(UiAction::SeekTo(seek_pos as f64));
+            if resp.drag_stopped() || resp.clicked() {
+                actions.push(UiAction::SeekTo(state.current_time));
+            }
+
+            // Hover tooltip with time
+            if resp.hovered() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let ratio = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                    let hover_time = ratio as f64 * state.duration;
+                    resp.on_hover_text(format_time(hover_time));
+                }
             }
         }
 
