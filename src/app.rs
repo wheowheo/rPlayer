@@ -55,6 +55,10 @@ pub struct UiState {
     pub context_menu_pos: egui::Pos2,
     pub frames_dropped: u64,
     pub frames_displayed: u64,
+    // Audio visualization
+    pub audio_peak_l: f32,
+    pub audio_peak_r: f32,
+    pub audio_waveform: Vec<f32>,
 }
 
 pub struct App {
@@ -395,6 +399,106 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     ).monospace().size(14.0).color(drop_color));
                 });
             });
+
+        // Audio visualizer — top right
+        let screen = ctx.screen_rect();
+        let vis_w = 220.0;
+        egui::Area::new(egui::Id::new("audio_vis"))
+            .fixed_pos(egui::pos2(screen.max.x - vis_w - 10.0, 36.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(vis_w);
+
+                    // Level meters
+                    ui.label(egui::RichText::new("Audio").monospace().size(12.0));
+
+                    let meter_h = 10.0;
+                    let meter_w = vis_w - 30.0;
+
+                    // L channel
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("L").monospace().size(11.0));
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(meter_w, meter_h), egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                        let level = state.audio_peak_l.clamp(0.0, 1.0);
+                        let fill = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.min.x + rect.width() * level, rect.max.y),
+                        );
+                        let color = if level > 0.9 {
+                            egui::Color32::from_rgb(255, 60, 60)
+                        } else if level > 0.6 {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            egui::Color32::from_rgb(60, 200, 60)
+                        };
+                        ui.painter().rect_filled(fill, 2.0, color);
+                    });
+
+                    // R channel
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("R").monospace().size(11.0));
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(meter_w, meter_h), egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                        let level = state.audio_peak_r.clamp(0.0, 1.0);
+                        let fill = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.min.x + rect.width() * level, rect.max.y),
+                        );
+                        let color = if level > 0.9 {
+                            egui::Color32::from_rgb(255, 60, 60)
+                        } else if level > 0.6 {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            egui::Color32::from_rgb(60, 200, 60)
+                        };
+                        ui.painter().rect_filled(fill, 2.0, color);
+                    });
+
+                    ui.add_space(4.0);
+
+                    // PCM Waveform oscilloscope
+                    ui.label(egui::RichText::new("Waveform").monospace().size(12.0));
+                    let wave_h = 60.0;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(vis_w, wave_h), egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(20));
+
+                    let waveform = &state.audio_waveform;
+                    if waveform.len() > 2 {
+                        let n = waveform.len().min(512);
+                        let start = waveform.len().saturating_sub(n);
+                        let samples = &waveform[start..];
+                        let step = samples.len() as f32 / rect.width();
+                        let mid_y = rect.center().y;
+
+                        let points: Vec<egui::Pos2> = (0..rect.width() as usize).map(|x| {
+                            let idx = (x as f32 * step) as usize;
+                            let val = samples.get(idx).copied().unwrap_or(0.0);
+                            let y = mid_y - val * (wave_h * 0.45);
+                            egui::pos2(rect.min.x + x as f32, y)
+                        }).collect();
+
+                        if points.len() > 1 {
+                            ui.painter().add(egui::Shape::line(
+                                points,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 200, 255)),
+                            ));
+                        }
+
+                        // Center line
+                        ui.painter().line_segment(
+                            [egui::pos2(rect.min.x, mid_y), egui::pos2(rect.max.x, mid_y)],
+                            egui::Stroke::new(0.5, egui::Color32::from_gray(60)),
+                        );
+                    }
+                });
+            });
     }
 
     // ========== Subtitle overlay ==========
@@ -567,6 +671,9 @@ impl App {
                 context_menu_pos: egui::Pos2::ZERO,
                 frames_dropped: 0,
                 frames_displayed: 0,
+                audio_peak_l: 0.0,
+                audio_peak_r: 0.0,
+                audio_waveform: Vec::new(),
             },
             pipeline: None,
             audio_output: None,
@@ -714,6 +821,16 @@ impl App {
                 self.ui_state.subtitle_text = text.to_string();
             } else {
                 self.ui_state.subtitle_text.clear();
+            }
+        }
+
+        // Update audio visualization data
+        if let Some(ref audio) = self.audio_output {
+            let vis = audio.vis.lock();
+            self.ui_state.audio_peak_l = vis.peak_l;
+            self.ui_state.audio_peak_r = vis.peak_r;
+            if self.ui_state.show_info_overlay {
+                self.ui_state.audio_waveform = vis.waveform.clone();
             }
         }
     }

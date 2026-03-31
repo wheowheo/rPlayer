@@ -76,6 +76,17 @@ impl ApplicationHandler for RPlayer {
     ) {
         let Some(app) = self.app.as_mut() else { return };
 
+        // Intercept Tab before egui eats it for widget focus navigation
+        if let WindowEvent::KeyboardInput { ref event, .. } = event {
+            if event.state.is_pressed() {
+                if let PhysicalKey::Code(KeyCode::Tab) = event.physical_key {
+                    app.handle_action(&UiAction::ToggleInfoOverlay);
+                    app.window.request_redraw();
+                    return;
+                }
+            }
+        }
+
         let response = app.egui_state.on_window_event(&app.window, &event);
         if response.repaint {
             app.window.request_redraw();
@@ -116,7 +127,7 @@ impl ApplicationHandler for RPlayer {
                         PhysicalKey::Code(KeyCode::BracketRight) => UiAction::SpeedUp,
                         PhysicalKey::Code(KeyCode::BracketLeft) => UiAction::SpeedDown,
                         PhysicalKey::Code(KeyCode::KeyM) => UiAction::MuteToggle,
-                        PhysicalKey::Code(KeyCode::Tab) => UiAction::ToggleInfoOverlay,
+                        // Tab is intercepted before egui (above)
                         PhysicalKey::Code(KeyCode::KeyR) => UiAction::ToggleDecoder,
                         PhysicalKey::Code(KeyCode::Equal) => {
                             if let Some(ref mut sub) = app.subtitle {
