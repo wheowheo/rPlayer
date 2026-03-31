@@ -14,6 +14,7 @@ pub struct AudioOutput {
     samples_played: Arc<AtomicU64>,
     buffer: Arc<Mutex<Vec<f32>>>,
     paused: Arc<AtomicBool>,
+    #[allow(dead_code)]
     sample_rate: u32,
 }
 
@@ -137,10 +138,12 @@ impl AudioOutput {
         self.paused.store(false, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn samples_played(&self) -> u64 {
         self.samples_played.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn playback_time_secs(&self) -> f64 {
         self.samples_played() as f64 / self.sample_rate as f64
     }

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
 use winit::window::Window;
 
 use crate::audio::output::AudioOutput;
@@ -17,6 +16,7 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Stopped,
+    #[allow(dead_code)]
     Buffering,
 }
 
@@ -139,10 +139,10 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             .fixed_pos(egui::pos2(screen.center().x, screen.max.y - 80.0))
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 180))
                     .inner_margin(egui::Margin::symmetric(12, 6))
-                    .rounding(4.0)
+                    .corner_radius(4.0)
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(&state.subtitle_text)

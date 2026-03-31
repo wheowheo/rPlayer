@@ -127,6 +127,7 @@ impl Clock {
         }
     }
 
+    #[allow(dead_code)]
     pub fn speed(&self) -> f64 {
         self.speed
     }

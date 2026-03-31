@@ -52,10 +52,6 @@ impl VideoDecoder {
         let stream = input.streams().nth(stream_index).unwrap();
         let time_base = f64::from(stream.time_base());
 
-        let codec_id = stream.parameters().id();
-        let codec = ffmpeg::decoder::find(codec_id)
-            .ok_or(ffmpeg::Error::DecoderNotFound)?;
-
         let mut context = Context::from_parameters(stream.parameters())?;
 
         // Try to create HW device context
@@ -227,10 +223,12 @@ impl VideoDecoder {
         self.last_scaler_key = (0, 0, 0);
     }
 
+    #[allow(dead_code)]
     pub fn width(&self) -> u32 {
         self.decoder.width()
     }
 
+    #[allow(dead_code)]
     pub fn height(&self) -> u32 {
         self.decoder.height()
     }

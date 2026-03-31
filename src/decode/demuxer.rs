@@ -3,6 +3,7 @@ use ffmpeg::format::context::Input;
 use ffmpeg::media::Type;
 use ffmpeg::Rational;
 
+#[allow(dead_code)]
 pub struct StreamInfo {
     pub index: usize,
     pub time_base: Rational,
@@ -99,7 +100,7 @@ pub fn open_input(path: &str) -> Result<(Input, DemuxerInfo), ffmpeg::Error> {
 }
 
 /// Seek to a position in seconds. Uses the video stream's time_base for precision.
-pub fn seek(ictx: &mut Input, target_secs: f64, video_stream_index: usize) -> Result<(), ffmpeg::Error> {
+pub fn seek(ictx: &mut Input, target_secs: f64, _video_stream_index: usize) -> Result<(), ffmpeg::Error> {
     // Convert seconds to AV_TIME_BASE units
     let ts = (target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
     unsafe {

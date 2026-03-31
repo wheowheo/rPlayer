@@ -1,13 +1,19 @@
+#[allow(dead_code)]
 mod ai;
 mod app;
 mod audio;
+#[allow(dead_code)]
 mod camera;
+#[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
 mod db;
 mod decode;
+#[allow(dead_code)]
 mod error;
 mod media;
 mod subtitle;
+#[allow(dead_code)]
 mod ui;
 mod video;
 

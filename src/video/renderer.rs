@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -246,6 +245,7 @@ impl VideoRenderer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_frame(&self) -> bool {
         self.bind_group.is_some()
     }

@@ -1,13 +1,16 @@
+#[allow(dead_code)]
 use crate::config;
+#[allow(dead_code)]
 use crate::decode::video_decoder::DecodedFrame;
 
+#[allow(dead_code)]
 pub enum SyncAction {
     Display(DecodedFrame),
     Drop,
     Wait,
 }
 
-/// Decide what to do with the next video frame based on clock time
+#[allow(dead_code)]
 pub fn sync_video_frame(frame: &DecodedFrame, clock_time: f64, frame_duration: f64) -> SyncAction {
     let diff = frame.pts_secs - clock_time;
 

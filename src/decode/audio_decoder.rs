@@ -7,8 +7,9 @@ use ffmpeg::ChannelLayout;
 
 use crate::config;
 
+#[allow(dead_code)]
 pub struct DecodedAudio {
-    pub data: Vec<f32>,   // interleaved stereo f32
+    pub data: Vec<f32>,
     pub pts_secs: f64,
     pub sample_rate: u32,
     pub channels: u16,
