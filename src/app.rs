@@ -5,9 +5,9 @@ use winit::window::Window;
 
 use crate::audio::output::AudioOutput;
 use crate::config;
-use crate::decode::video_decoder::DecodedFrame;
+use crate::decode::video_decoder::{DecodeMode, DecodedFrame};
 use crate::media::clock::Clock;
-use crate::media::pipeline::MediaPipeline;
+use crate::media::pipeline::{MediaPipeline, PipelineCommand};
 use crate::subtitle::SubtitleTrack;
 use crate::video::renderer::VideoRenderer;
 
@@ -30,6 +30,7 @@ pub struct UiState {
     pub video_info: String,
     pub show_info_overlay: bool,
     pub subtitle_text: String,
+    pub decode_mode: String,
 }
 
 pub struct App {
@@ -95,6 +96,11 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
             ui.separator();
             ui.label(format!("배속: {:.2}x", state.speed));
 
+            if !state.decode_mode.is_empty() {
+                ui.separator();
+                ui.label(&state.decode_mode);
+            }
+
             if !state.video_info.is_empty() {
                 ui.separator();
                 ui.label(&state.video_info);
@@ -118,6 +124,9 @@ fn draw_ui(ctx: &egui::Context, state: &UiState) {
                             state.volume * 100.0,
                             if state.muted { " (음소거)" } else { "" }
                         )
+                    ).monospace().size(14.0));
+                    ui.label(egui::RichText::new(
+                        format!("디코더: {} (R로 전환)", state.decode_mode)
                     ).monospace().size(14.0));
                 });
             });
@@ -242,6 +251,7 @@ impl App {
                 video_info: String::new(),
                 show_info_overlay: false,
                 subtitle_text: String::new(),
+                decode_mode: "SW".to_string(),
             },
             pipeline: None,
             audio_output: None,
@@ -261,7 +271,7 @@ impl App {
         }
         self.audio_output = None;
 
-        match MediaPipeline::open(path) {
+        match MediaPipeline::open(path, true) {
             Ok(mut pipeline) => {
                 let info = &pipeline.info;
                 self.ui_state.duration = info.duration_secs;
@@ -345,6 +355,8 @@ impl App {
             return;
         }
 
+        self.update_decode_mode_display();
+
         let Some(pipeline) = &self.pipeline else { return };
         let Some(clock) = &mut self.clock else { return };
 
@@ -417,6 +429,27 @@ impl App {
             } else {
                 self.ui_state.subtitle_text.clear();
             }
+        }
+    }
+
+    pub fn toggle_decode_mode(&mut self) {
+        if let Some(p) = &self.pipeline {
+            let current = p.current_decode_mode();
+            let new_mode = match current {
+                DecodeMode::Software => DecodeMode::Hardware,
+                DecodeMode::Hardware => DecodeMode::Software,
+            };
+            let _ = p.cmd_tx.send(PipelineCommand::SetDecodeMode(new_mode));
+        }
+    }
+
+    pub fn update_decode_mode_display(&mut self) {
+        if let Some(p) = &self.pipeline {
+            let mode = p.current_decode_mode();
+            self.ui_state.decode_mode = match mode {
+                DecodeMode::Hardware => "HW".to_string(),
+                DecodeMode::Software => "SW".to_string(),
+            };
         }
     }
 

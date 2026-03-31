@@ -185,6 +185,9 @@ impl ApplicationHandler for RPlayer {
                                 sub.adjust_sync(-0.5);
                             }
                         }
+                        PhysicalKey::Code(KeyCode::KeyR) => {
+                            app.toggle_decode_mode();
+                        }
                         _ => {}
                     }
                 }
