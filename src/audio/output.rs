@@ -16,7 +16,7 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    pub fn new(audio_rx: Receiver<DecodedAudio>) -> anyhow::Result<Self> {
+    pub fn new(audio_rx: Receiver<DecodedAudio>, samples_played: Arc<AtomicU64>) -> anyhow::Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device()
             .ok_or_else(|| anyhow::anyhow!("No audio output device found"))?;
@@ -31,7 +31,6 @@ impl AudioOutput {
 
         let volume = Arc::new(AtomicU64::new(f64::to_bits(1.0)));
         let muted = Arc::new(AtomicU64::new(0));
-        let samples_played = Arc::new(AtomicU64::new(0));
 
         let volume_clone = volume.clone();
         let muted_clone = muted.clone();

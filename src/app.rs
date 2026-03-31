@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use winit::window::Window;
 
 use crate::audio::output::AudioOutput;
 use crate::config;
+use crate::decode::video_decoder::DecodedFrame;
+use crate::media::clock::Clock;
 use crate::media::pipeline::MediaPipeline;
 use crate::video::renderer::VideoRenderer;
 
@@ -47,8 +50,9 @@ pub struct App {
     // Media
     pub pipeline: Option<MediaPipeline>,
     pub audio_output: Option<AudioOutput>,
-    last_frame_time: Option<Instant>,
-    last_pts: f64,
+    pub clock: Option<Clock>,
+    pending_frame: Option<DecodedFrame>,
+    video_fps: f64,
 
     // Window
     pub window: Arc<Window>,
@@ -190,8 +194,9 @@ impl App {
             },
             pipeline: None,
             audio_output: None,
-            last_frame_time: None,
-            last_pts: 0.0,
+            clock: None,
+            pending_frame: None,
+            video_fps: 0.0,
             window,
             video_size: None,
         })
@@ -226,24 +231,31 @@ impl App {
                     let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
                 }
 
-                // Start audio output if audio stream exists
+                // Start audio output and clock
+                let samples_played = Arc::new(AtomicU64::new(0));
                 if let Some(audio_rx) = pipeline.audio_rx.take() {
-                    match AudioOutput::new(audio_rx) {
+                    match AudioOutput::new(audio_rx, samples_played.clone()) {
                         Ok(audio) => {
                             audio.set_volume(self.ui_state.volume);
                             audio.set_muted(self.ui_state.muted);
                             self.audio_output = Some(audio);
+                            self.clock = Some(Clock::new(samples_played));
                             log::info!("Audio output started");
                         }
-                        Err(e) => log::error!("Failed to start audio: {}", e),
+                        Err(e) => {
+                            log::error!("Failed to start audio: {}", e);
+                            self.clock = Some(Clock::wall_only());
+                        }
                     }
+                } else {
+                    self.clock = Some(Clock::wall_only());
                 }
 
+                self.video_fps = info.video_fps;
                 self.pipeline = Some(pipeline);
                 self.ui_state.playback_state = PlaybackState::Playing;
                 self.ui_state.current_time = 0.0;
-                self.last_frame_time = None;
-                self.last_pts = 0.0;
+                self.pending_frame = None;
 
                 let file_name = std::path::Path::new(path)
                     .file_name()
@@ -265,13 +277,45 @@ impl App {
         }
 
         let Some(pipeline) = &self.pipeline else { return };
+        let Some(clock) = &mut self.clock else { return };
 
-        // Try to receive a decoded frame (non-blocking)
-        match pipeline.frame_rx.try_recv() {
-            Ok(frame) => {
-                self.ui_state.current_time = frame.pts_secs;
-                self.last_pts = frame.pts_secs;
+        let clock_time = clock.time();
+        self.ui_state.current_time = clock_time;
 
+        let frame_duration = if self.video_fps > 0.0 {
+            1.0 / self.video_fps
+        } else {
+            1.0 / 30.0
+        };
+
+        // Try to get a frame to display
+        loop {
+            // Use pending frame first, or try to receive a new one
+            let frame = if self.pending_frame.is_some() {
+                self.pending_frame.take().unwrap()
+            } else {
+                match pipeline.frame_rx.try_recv() {
+                    Ok(f) => f,
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.ui_state.playback_state = PlaybackState::Stopped;
+                        log::info!("Playback finished");
+                        return;
+                    }
+                }
+            };
+
+            let diff = frame.pts_secs - clock_time;
+
+            if diff < -frame_duration {
+                // Frame is late — drop it and try next
+                continue;
+            } else if diff > config::SYNC_THRESHOLD_SECS {
+                // Frame is early — save for next render cycle
+                self.pending_frame = Some(frame);
+                break;
+            } else {
+                // Display this frame
                 self.video_renderer.upload_rgba_frame(
                     &self.device,
                     &self.queue,
@@ -279,14 +323,7 @@ impl App {
                     frame.height,
                     &frame.data,
                 );
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                // No frame ready yet, keep displaying previous
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                // Pipeline finished
-                self.ui_state.playback_state = PlaybackState::Stopped;
-                log::info!("Playback finished");
+                break;
             }
         }
     }
