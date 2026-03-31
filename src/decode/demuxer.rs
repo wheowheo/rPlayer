@@ -97,3 +97,24 @@ pub fn open_input(path: &str) -> Result<(Input, DemuxerInfo), ffmpeg::Error> {
 
     Ok((ictx, info))
 }
+
+/// Seek to a position in seconds. Uses the video stream's time_base for precision.
+pub fn seek(ictx: &mut Input, target_secs: f64, video_stream_index: usize) -> Result<(), ffmpeg::Error> {
+    // Convert seconds to AV_TIME_BASE units
+    let ts = (target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+    unsafe {
+        let ret = ffmpeg::ffi::avformat_seek_file(
+            ictx.as_mut_ptr(),
+            -1, // default stream
+            i64::MIN,
+            ts,
+            ts,
+            0,
+        );
+        if ret < 0 {
+            Err(ffmpeg::Error::from(ret))
+        } else {
+            Ok(())
+        }
+    }
+}

@@ -138,11 +138,38 @@ impl ApplicationHandler for RPlayer {
                                 audio.set_volume(app.ui_state.volume);
                             }
                         }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            let target = (app.ui_state.current_time + config::SEEK_STEP_SECS)
+                                .min(app.ui_state.duration);
+                            if let Some(p) = &app.pipeline {
+                                let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Seek(target));
+                            }
+                            app.pending_frame = None;
+                            if let Some(ref mut clock) = app.clock {
+                                clock.reset();
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            let target = (app.ui_state.current_time - config::SEEK_STEP_SECS).max(0.0);
+                            if let Some(p) = &app.pipeline {
+                                let _ = p.cmd_tx.send(media::pipeline::PipelineCommand::Seek(target));
+                            }
+                            app.pending_frame = None;
+                            if let Some(ref mut clock) = app.clock {
+                                clock.reset();
+                            }
+                        }
                         PhysicalKey::Code(KeyCode::BracketRight) => {
                             app.ui_state.speed = (app.ui_state.speed + config::SPEED_STEP).min(config::MAX_SPEED);
+                            if let Some(ref mut clock) = app.clock {
+                                clock.set_speed(app.ui_state.speed);
+                            }
                         }
                         PhysicalKey::Code(KeyCode::BracketLeft) => {
                             app.ui_state.speed = (app.ui_state.speed - config::SPEED_STEP).max(config::MIN_SPEED);
+                            if let Some(ref mut clock) = app.clock {
+                                clock.set_speed(app.ui_state.speed);
+                            }
                         }
                         PhysicalKey::Code(KeyCode::KeyM) => {
                             app.ui_state.muted = !app.ui_state.muted;

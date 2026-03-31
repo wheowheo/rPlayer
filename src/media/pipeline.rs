@@ -4,6 +4,7 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
+use ffmpeg::codec::packet::Packet;
 
 use crate::decode::audio_decoder::{AudioDecoder, DecodedAudio};
 use crate::decode::demuxer::{self, DemuxerInfo};
@@ -13,6 +14,7 @@ pub enum PipelineCommand {
     Stop,
     Pause,
     Resume,
+    Seek(f64),
 }
 
 pub struct MediaPipeline {
@@ -91,13 +93,47 @@ fn decode_thread(
     }).transpose()?;
 
     let mut paused = false;
+    let mut seek_target_pts: Option<f64> = None;
 
-    for (stream, packet) in ictx.packets() {
-        while let Ok(cmd) = cmd_rx.try_recv() {
+    loop {
+        // Check commands
+        loop {
+            let cmd = if paused {
+                cmd_rx.recv_timeout(std::time::Duration::from_millis(50)).ok()
+            } else {
+                cmd_rx.try_recv().ok()
+            };
+
             match cmd {
-                PipelineCommand::Stop => return Ok(()),
-                PipelineCommand::Pause => paused = true,
-                PipelineCommand::Resume => paused = false,
+                Some(PipelineCommand::Stop) => return Ok(()),
+                Some(PipelineCommand::Pause) => paused = true,
+                Some(PipelineCommand::Resume) => { paused = false; break; }
+                Some(PipelineCommand::Seek(target)) => {
+                    // Perform seek
+                    if let Err(e) = demuxer::seek(&mut ictx, target, video_stream_index) {
+                        log::error!("Seek error: {}", e);
+                    } else {
+                        video_decoder.flush();
+                        if let Some(ref mut adec) = audio_decoder {
+                            adec.flush();
+                        }
+                        seek_target_pts = Some(target);
+                        // Drain channels
+                        while frame_tx.try_send(DecodedFrame {
+                            width: 0, height: 0, data: Vec::new(), pts_secs: -1.0,
+                        }).is_ok() {}
+                    }
+                    if paused {
+                        paused = false;
+                    }
+                    break;
+                }
+                None => {
+                    if paused {
+                        continue; // Keep waiting
+                    }
+                    break;
+                }
             }
         }
 
@@ -105,31 +141,37 @@ fn decode_thread(
             return Ok(());
         }
 
-        while paused && running.load(Ordering::Relaxed) {
-            match cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(PipelineCommand::Stop) => return Ok(()),
-                Ok(PipelineCommand::Resume) => { paused = false; break; }
-                Ok(PipelineCommand::Pause) => {}
-                Err(_) => {}
-            }
+        // Read next packet
+        let mut packet = Packet::empty();
+        match packet.read(&mut ictx) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Eof) => break,
+            Err(_) => break,
         }
 
-        let idx = stream.index();
+        let stream_index = packet.stream();
 
-        if idx == video_stream_index {
+        if stream_index == video_stream_index {
             if video_decoder.send_packet(&packet).is_err() {
                 continue;
             }
             loop {
                 match video_decoder.receive_frame() {
                     Ok(Some(frame)) => {
+                        // Skip frames before seek target
+                        if let Some(target) = seek_target_pts {
+                            if frame.pts_secs < target - 0.1 {
+                                continue;
+                            }
+                            seek_target_pts = None;
+                        }
                         if frame_tx.send(frame).is_err() { return Ok(()); }
                     }
                     Ok(None) => break,
                     Err(_) => break,
                 }
             }
-        } else if Some(idx) == audio_stream_index {
+        } else if Some(stream_index) == audio_stream_index {
             if let Some(ref mut adec) = audio_decoder {
                 if adec.send_packet(&packet).is_err() {
                     continue;
@@ -137,6 +179,12 @@ fn decode_thread(
                 loop {
                     match adec.receive_frame() {
                         Ok(Some(audio)) => {
+                            // Skip audio before seek target
+                            if let Some(target) = seek_target_pts {
+                                if audio.pts_secs < target - 0.1 {
+                                    continue;
+                                }
+                            }
                             if audio_tx.send(audio).is_err() { return Ok(()); }
                         }
                         Ok(None) => break,

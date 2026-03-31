@@ -51,7 +51,7 @@ pub struct App {
     pub pipeline: Option<MediaPipeline>,
     pub audio_output: Option<AudioOutput>,
     pub clock: Option<Clock>,
-    pending_frame: Option<DecodedFrame>,
+    pub pending_frame: Option<DecodedFrame>,
     video_fps: f64,
 
     // Window
