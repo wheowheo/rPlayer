@@ -38,6 +38,7 @@ pub enum UiAction {
     ToggleInfoOverlay,
     SeekTo(f64),
     FrameStep,
+    ToggleLibraryInfo,
 }
 
 pub struct UiState {
@@ -53,6 +54,7 @@ pub struct UiState {
     pub subtitle_text: String,
     pub decode_mode: String,
     pub show_context_menu: bool,
+    pub show_library_info: bool,
     pub context_menu_pos: egui::Pos2,
     pub frames_dropped: u64,
     pub frames_displayed: u64,
@@ -192,6 +194,11 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                 ui.separator();
                 if ui.button(format!("디코더 전환  R  [{}]", state.decode_mode)).clicked() {
                     actions.push(UiAction::ToggleDecoder);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("라이브러리 정보...").clicked() {
+                    actions.push(UiAction::ToggleLibraryInfo);
                     ui.close_menu();
                 }
             });
@@ -630,7 +637,83 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
             });
     }
 
+    // ========== Library info window ==========
+    if state.show_library_info {
+        let mut open = state.show_library_info;
+        egui::Window::new("라이브러리 정보")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(format!(
+                    "rPlayer v{}", env!("CARGO_PKG_VERSION")
+                )).strong().size(16.0));
+                ui.label("Rust 크로스플랫폼 비디오 플레이어");
+                ui.separator();
+
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new("핵심 라이브러리").strong());
+                    draw_lib_table(ui, &[
+                        ("ffmpeg-next", "8.1.0", "FFmpeg 바인딩 — 비디오/오디오 디코딩"),
+                        ("wgpu", "24.0.5", "WebGPU 렌더링 — Metal/DX12/Vulkan"),
+                        ("winit", "0.30.13", "크로스플랫폼 윈도우 관리"),
+                        ("egui", "0.31.1", "즉시 모드 UI 프레임워크"),
+                        ("egui-wgpu", "0.31.1", "egui + wgpu 통합 렌더러"),
+                        ("egui-winit", "0.31.1", "egui + winit 입력 통합"),
+                        ("cpal", "0.15.3", "크로스플랫폼 오디오 출력"),
+                    ]);
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("미디어 처리").strong());
+                    draw_lib_table(ui, &[
+                        ("rubato", "0.16.2", "오디오 리샘플링 (피치 보존)"),
+                        ("rusqlite", "0.32.1", "SQLite 데이터베이스 (bundled)"),
+                        ("rfd", "0.15.4", "네이티브 파일 대화상자"),
+                        ("sysinfo", "0.33.1", "시스템 리소스 모니터링"),
+                    ]);
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("유틸리티").strong());
+                    draw_lib_table(ui, &[
+                        ("crossbeam-channel", "0.5.15", "스레드 간 채널 통신"),
+                        ("parking_lot", "0.12.5", "고성능 뮤텍스"),
+                        ("bytemuck", "1.25.0", "안전한 바이트 캐스팅"),
+                        ("anyhow", "1.0.102", "에러 처리"),
+                        ("thiserror", "2.0.18", "에러 타입 정의"),
+                        ("log", "0.4.29", "로깅 인터페이스"),
+                        ("env_logger", "0.11.10", "환경변수 로그 설정"),
+                        ("pollster", "0.4.0", "async 블로킹 실행"),
+                        ("ringbuf", "0.4.8", "링 버퍼"),
+                    ]);
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("시스템 프레임워크").strong().size(13.0));
+                    #[cfg(target_os = "macos")]
+                    ui.label("VideoToolbox, CoreAudio, Metal, AppKit, CoreML, Vision, AVFoundation, SceneKit");
+                    #[cfg(target_os = "windows")]
+                    ui.label("D3D11VA, WASAPI, Direct3D 12, Win32");
+                    #[cfg(target_os = "linux")]
+                    ui.label("VAAPI, ALSA, Vulkan, X11/Wayland");
+                });
+            });
+        state.show_library_info = open;
+    }
+
     actions
+}
+
+fn draw_lib_table(ui: &mut egui::Ui, libs: &[(&str, &str, &str)]) {
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(3)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            for &(name, ver, desc) in libs {
+                ui.label(egui::RichText::new(name).monospace().strong().size(13.0));
+                ui.label(egui::RichText::new(ver).monospace().size(12.0).color(egui::Color32::from_gray(160)));
+                ui.label(egui::RichText::new(desc).size(12.0));
+                ui.end_row();
+            }
+        });
 }
 
 fn configure_fonts(ctx: &egui::Context) {
@@ -777,6 +860,7 @@ impl App {
                 decode_mode: "SW".to_string(),
                 render_fps: 0.0,
                 show_context_menu: false,
+                show_library_info: false,
                 context_menu_pos: egui::Pos2::ZERO,
                 frames_dropped: 0,
                 frames_displayed: 0,
@@ -1053,6 +1137,9 @@ impl App {
             }
             UiAction::ToggleInfoOverlay => {
                 self.ui_state.show_info_overlay = !self.ui_state.show_info_overlay;
+            }
+            UiAction::ToggleLibraryInfo => {
+                self.ui_state.show_library_info = !self.ui_state.show_library_info;
             }
             UiAction::FrameStep => {
                 // Pause + advance one frame
