@@ -191,7 +191,8 @@ cargo build --release
 ### Ubuntu / Debian
 ```bash
 sudo apt install -y libavcodec-dev libavformat-dev libavutil-dev \
-    libswscale-dev libswresample-dev pkg-config libasound2-dev libvulkan-dev
+    libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev \
+    pkg-config libasound2-dev libvulkan-dev
 git clone https://github.com/wheowheo/rPlayer.git && cd rPlayer
 cargo build --release
 ```
