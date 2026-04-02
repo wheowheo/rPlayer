@@ -83,6 +83,7 @@ fi
 if [ "$DO_RELEASE" = true ]; then
     echo -e "${B}빌드 + 패키징...${NC}"
     bash scripts/build.sh release 2>&1 | tail -1
+    bash scripts/bundle.sh 2>&1 | tail -1
     bash scripts/package.sh 2>&1 | tail -1
 
     echo -e "${B}GitHub Release 생성...${NC}"

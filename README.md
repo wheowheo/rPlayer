@@ -17,139 +17,80 @@ FFmpeg 8.1 + wgpu + egui 기반, 하드웨어 가속 디코딩, 4K 60fps 재생.
 
 ---
 
-## 설치
+## 설치 (원라인)
 
-### macOS (Apple Silicon / Intel)
+외부 의존성 없이 바로 실행 가능. FFmpeg 등 모든 라이브러리가 앱에 내장.
 
-#### Homebrew로 의존성 설치
+### macOS
 ```bash
-brew install ffmpeg pkgconf
+curl -fsSL https://raw.githubusercontent.com/wheowheo/rPlayer/main/scripts/install.sh | bash
 ```
 
-#### 사전 빌드 바이너리 (Apple Silicon)
-[Releases](https://github.com/wheowheo/rPlayer/releases)에서 다운로드:
+설치 후:
 ```bash
-# tar.gz 다운로드 후
-tar xzf rplayer-*-macos-arm64.tar.gz
-./rplayer video.mp4
+open ~/Applications/rPlayer.app                              # GUI 실행
+~/Applications/rPlayer.app/Contents/MacOS/rplayer video.mp4  # CLI 실행
+
+# PATH에 추가 (선택)
+sudo ln -sf ~/Applications/rPlayer.app/Contents/MacOS/rplayer /usr/local/bin/rplayer
+rplayer video.mp4
 ```
 
-#### .app 번들
-```bash
-tar xzf rplayer-*.app.tar.gz
-# rPlayer-0.2.0.app을 Applications 폴더로 이동
-# 또는 더블클릭으로 실행
-```
-
-#### 소스에서 빌드
-```bash
-# Rust 설치 (없는 경우)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 의존성
-brew install ffmpeg pkgconf
-
-# 빌드
-git clone https://github.com/wheowheo/rPlayer.git
-cd rPlayer
-cargo build --release
-
-# 실행
-./target/release/rplayer video.mp4
-```
-
----
-
-### Windows (x64)
-
-#### 1. Rust 설치
-https://rustup.rs 에서 `rustup-init.exe` 다운로드 후 실행.  
-Visual Studio Build Tools (MSVC)가 필요하다.
-
-#### 2. FFmpeg 설치
-
-**방법 A — vcpkg (권장)**
-```powershell
-git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-C:\vcpkg\bootstrap-vcpkg.bat
-C:\vcpkg\vcpkg install ffmpeg:x64-windows
-
-# 환경변수 설정
-set VCPKG_ROOT=C:\vcpkg
-```
-
-**방법 B — 사전 빌드 패키지**
-1. https://github.com/GyanD/codexffmpeg/releases 에서 `ffmpeg-*-full_build-shared.zip` 다운로드
-2. 압축 해제 후 환경변수 설정:
-```powershell
-set FFMPEG_DIR=C:\ffmpeg
-set PATH=%FFMPEG_DIR%\bin;%PATH%
-```
-
-#### 3. pkgconf 설치
-```powershell
-choco install pkgconfiglite
-```
-또는 https://github.com/pkgconf/pkgconf/releases 에서 수동 설치.
-
-#### 4. 빌드
-```powershell
-git clone https://github.com/wheowheo/rPlayer.git
-cd rPlayer
-cargo build --release
-.\target\release\rplayer.exe video.mp4
-```
-
-#### 사전 빌드 바이너리
+### Windows
 [Releases](https://github.com/wheowheo/rPlayer/releases)에서 `rplayer-windows-x64.zip` 다운로드.  
-FFmpeg DLL이 동봉되어 있으므로 별도 설치 불필요.
+FFmpeg DLL 동봉 — 별도 설치 불필요.
+```powershell
+# 압축 해제 후
+.\rplayer.exe video.mp4
+```
+
+### Linux
+```bash
+curl -fsSL https://raw.githubusercontent.com/wheowheo/rPlayer/main/scripts/install.sh | bash
+```
+
+설치 후:
+```bash
+rplayer video.mp4
+```
 
 ---
+
+## 소스에서 빌드 (개발자용)
+
+### macOS
+```bash
+brew install ffmpeg pkgconf
+git clone https://github.com/wheowheo/rPlayer.git && cd rPlayer
+cargo build --release
+bash scripts/bundle.sh  # FFmpeg 내장 .app 생성
+```
+
+### Windows
+```powershell
+# vcpkg로 FFmpeg 설치
+vcpkg install ffmpeg:x64-windows
+set VCPKG_ROOT=C:\vcpkg
+choco install pkgconfiglite
+
+git clone https://github.com/wheowheo/rPlayer.git && cd rPlayer
+cargo build --release
+```
 
 ### Linux (Ubuntu/Debian)
-
-#### 의존성 설치
 ```bash
-sudo apt update
-sudo apt install -y \
-    libavcodec-dev libavformat-dev libavutil-dev \
-    libswscale-dev libswresample-dev \
-    pkg-config libasound2-dev \
-    libvulkan-dev
-```
+sudo apt install -y libavcodec-dev libavformat-dev libavutil-dev \
+    libswscale-dev libswresample-dev pkg-config libasound2-dev libvulkan-dev
 
-#### Fedora/RHEL
-```bash
-sudo dnf install -y \
-    ffmpeg-devel pkgconf \
-    alsa-lib-devel vulkan-loader-devel
-```
-
-#### Arch Linux
-```bash
-sudo pacman -S ffmpeg pkgconf alsa-lib vulkan-icd-loader
-```
-
-#### Rust 설치 + 빌드
-```bash
-# Rust (없는 경우)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# 빌드
-git clone https://github.com/wheowheo/rPlayer.git
-cd rPlayer
+git clone https://github.com/wheowheo/rPlayer.git && cd rPlayer
 cargo build --release
-
-# 실행
-./target/release/rplayer video.mp4
 ```
 
-#### 사전 빌드 바이너리
-[Releases](https://github.com/wheowheo/rPlayer/releases)에서 `rplayer-linux-x64.tar.gz` 다운로드.  
-시스템에 FFmpeg 런타임 라이브러리가 필요:
+### Linux (Fedora)
 ```bash
-sudo apt install libavcodec60 libavformat60 libswscale7 libswresample4
+sudo dnf install -y ffmpeg-devel pkgconf alsa-lib-devel vulkan-loader-devel
+git clone https://github.com/wheowheo/rPlayer.git && cd rPlayer
+cargo build --release
 ```
 
 ---
