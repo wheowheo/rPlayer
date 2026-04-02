@@ -11,65 +11,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ===== macOS: ARM64 + x86_64 네이티브 빌드 =====
   build-macos:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
 
-      - name: FFmpeg + pkgconf 설치
+      - name: FFmpeg + pkgconf
         run: brew install ffmpeg pkgconf
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Bundle (standalone .app with dylibs)
+        run: bash scripts/bundle.sh
+
+      - name: Upload standalone
+        uses: actions/upload-artifact@v4
         with:
-          targets: ${{ matrix.target }}
+          name: rplayer-macos
+          path: dist/rPlayer-*-macos-standalone.tar.gz
 
-      - name: 빌드
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rplayer-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/rplayer
-
-  # ===== macOS: Universal Binary (.app 번들) =====
-  package-macos:
-    needs: build-macos
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: rplayer-aarch64-apple-darwin
-          path: arm64/
-      - uses: actions/download-artifact@v4
-        with:
-          name: rplayer-x86_64-apple-darwin
-          path: x64/
-
-      - name: Universal Binary 생성
-        run: |
-          chmod +x arm64/rplayer x64/rplayer
-          lipo -create arm64/rplayer x64/rplayer -output rplayer
-          file rplayer
-
-      - name: .app 번들 패키징
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          bash scripts/package.sh
-          cp dist/rplayer-*.tar.gz .
-          cp dist/rplayer-*.app.tar.gz . 2>/dev/null || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rplayer-macos-universal
-          path: "*.tar.gz"
-
-  # ===== Windows: 네이티브 빌드 (MSVC + FFmpeg) =====
   build-windows:
     runs-on: windows-latest
     steps:
@@ -77,7 +40,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: FFmpeg dev 패키지 다운로드
+      - name: FFmpeg (pre-built shared)
         shell: pwsh
         run: |
           $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-full_build-shared.zip"
@@ -88,20 +51,20 @@ jobs:
           echo "$ffdir\bin" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=$ffdir\lib\pkgconfig" >> $env:GITHUB_ENV
 
-      - name: pkgconf 설치
+      - name: pkgconf
         run: choco install pkgconfiglite -y
 
-      - name: 빌드
+      - name: Build
         run: cargo build --release
 
-      - name: 패키징
+      - name: Package
         shell: pwsh
         run: |
           $ffdir = $env:FFMPEG_DIR
           mkdir dist
           cp target\release\rplayer.exe dist\
           cp MANUAL.md dist\
-          # FFmpeg DLL 동봉
+          cp README.md dist\
           Get-ChildItem "$ffdir\bin\*.dll" | ForEach-Object { Copy-Item $_.FullName dist\ }
           Compress-Archive -Path dist\* -DestinationPath rplayer-windows-x64.zip
 
@@ -110,13 +73,12 @@ jobs:
           name: rplayer-windows-x64
           path: rplayer-windows-x64.zip
 
-  # ===== Linux: 네이티브 빌드 (Ubuntu) =====
   build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: FFmpeg dev 패키지 설치
+      - name: FFmpeg dev
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -126,35 +88,34 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: 빌드
+      - name: Build
         run: cargo build --release
 
-      - name: 패키징
+      - name: Package
         run: |
-          mkdir -p dist
-          cp target/release/rplayer dist/
-          cp MANUAL.md dist/
-          tar czf rplayer-linux-x64.tar.gz -C dist .
+          mkdir -p pkg
+          cp target/release/rplayer pkg/
+          cp MANUAL.md README.md pkg/
+          tar czf rplayer-linux-x64.tar.gz -C pkg .
 
       - uses: actions/upload-artifact@v4
         with:
           name: rplayer-linux-x64
           path: rplayer-linux-x64.tar.gz
 
-  # ===== Release: 태그 푸시 시 자동 배포 =====
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package-macos, build-windows, build-linux]
+    needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
 
-      - name: Release 업로드
+      - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            rplayer-macos-universal/*.tar.gz
+            rplayer-macos/*.tar.gz
             rplayer-windows-x64/rplayer-windows-x64.zip
             rplayer-linux-x64/rplayer-linux-x64.tar.gz
