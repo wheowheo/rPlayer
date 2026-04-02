@@ -4,7 +4,7 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{context as sws_context, flag};
 use ffmpeg::util::frame::video::Video;
 
-use crate::video::renderer::{FrameFormat, PlaneData, RawFrame};
+use crate::video::renderer::{ColorRange, ColorSpace, FrameFormat, PlaneData, RawFrame};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DecodeMode {
@@ -123,10 +123,14 @@ impl VideoDecoder {
                 let h = frame_ref.height();
                 let fmt = frame_ref.format();
 
+                // Extract color metadata from FFmpeg frame
+                let cs = Self::detect_color_space(frame_ref);
+                let cr = Self::detect_color_range(frame_ref);
+
                 match fmt {
-                    Pixel::YUV420P => Ok(Some(self.extract_yuv420p(frame_ref, w, h, pts_secs))),
-                    Pixel::NV12 => Ok(Some(self.extract_nv12(frame_ref, w, h, pts_secs))),
-                    _ => Ok(Some(self.convert_to_yuv420p(frame_ref, w, h, pts_secs)?)),
+                    Pixel::YUV420P => Ok(Some(self.extract_yuv420p(frame_ref, w, h, pts_secs, cs, cr))),
+                    Pixel::NV12 => Ok(Some(self.extract_nv12(frame_ref, w, h, pts_secs, cs, cr))),
+                    _ => Ok(Some(self.convert_to_yuv420p(frame_ref, w, h, pts_secs, cs, cr)?)),
                 }
             }
             Err(ffmpeg::Error::Other { errno: ffmpeg::ffi::EAGAIN }) => Ok(None),
@@ -134,8 +138,31 @@ impl VideoDecoder {
         }
     }
 
-    /// Extract YUV420P planes — reuses internal buffers to avoid allocation
-    fn extract_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
+    fn detect_color_space(frame: &Video) -> ColorSpace {
+        match frame.color_space() {
+            ffmpeg::color::Space::BT709 => ColorSpace::Bt709,
+            ffmpeg::color::Space::BT2020NCL | ffmpeg::color::Space::BT2020CL => ColorSpace::Bt2020,
+            ffmpeg::color::Space::BT470BG | ffmpeg::color::Space::SMPTE170M => ColorSpace::Bt601,
+            _ => {
+                // Auto-detect from resolution: HD+ → BT.709, SD → BT.601
+                if frame.width() >= 1280 {
+                    ColorSpace::Bt709
+                } else {
+                    ColorSpace::Bt601
+                }
+            }
+        }
+    }
+
+    fn detect_color_range(frame: &Video) -> ColorRange {
+        match frame.color_range() {
+            ffmpeg::color::Range::JPEG => ColorRange::Full,
+            ffmpeg::color::Range::MPEG => ColorRange::Limited,
+            _ => ColorRange::Limited, // Default: TV range
+        }
+    }
+
+    fn extract_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64, cs: ColorSpace, cr: ColorRange) -> RawFrame {
         let cw = (w / 2) as usize;
         let ch = (h / 2) as usize;
         let sizes = [(w as usize, h as usize), (cw, ch), (cw, ch)];
@@ -167,10 +194,10 @@ impl VideoDecoder {
             });
         }
 
-        RawFrame { format: FrameFormat::Yuv420p, width: w, height: h, planes, pts_secs }
+        RawFrame { format: FrameFormat::Yuv420p, width: w, height: h, planes, pts_secs, color_space: cs, color_range: cr }
     }
 
-    fn extract_nv12(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> RawFrame {
+    fn extract_nv12(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64, cs: ColorSpace, cr: ColorRange) -> RawFrame {
         let cw = (w / 2) as usize;
         let ch = (h / 2) as usize;
         // Y plane: w x h, 1 bpp.  UV plane: cw x ch, 2 bpp.
@@ -207,10 +234,10 @@ impl VideoDecoder {
             });
         }
 
-        RawFrame { format: FrameFormat::Nv12, width: w, height: h, planes, pts_secs }
+        RawFrame { format: FrameFormat::Nv12, width: w, height: h, planes, pts_secs, color_space: cs, color_range: cr }
     }
 
-    fn convert_to_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64) -> Result<RawFrame, ffmpeg::Error> {
+    fn convert_to_yuv420p(&mut self, frame: &Video, w: u32, h: u32, pts_secs: f64, cs: ColorSpace, cr: ColorRange) -> Result<RawFrame, ffmpeg::Error> {
         let fmt = frame.format();
         let key = (w, h, fmt as i32);
         if self.scaler.is_none() || self.last_scaler_key != key {
@@ -221,7 +248,7 @@ impl VideoDecoder {
         }
         let mut yuv = Video::empty();
         self.scaler.as_mut().unwrap().run(frame, &mut yuv)?;
-        Ok(self.extract_yuv420p(&yuv, w, h, pts_secs))
+        Ok(self.extract_yuv420p(&yuv, w, h, pts_secs, cs, cr))
     }
 
     fn transfer_hw_frame(&self, hw_frame: &Video) -> Result<Option<Video>, ffmpeg::Error> {

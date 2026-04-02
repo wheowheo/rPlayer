@@ -825,10 +825,11 @@ impl App {
         let queue = Arc::new(queue);
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer non-sRGB to avoid double gamma on YUV video
         let surface_format = surface_caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 

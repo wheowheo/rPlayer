@@ -156,6 +156,8 @@ fn decode_thread(
                             while frame_tx.try_send(RawFrame {
                                 format: crate::video::renderer::FrameFormat::Yuv420p,
                                 width: 2, height: 2, planes: vec![], pts_secs: -1.0,
+                                color_space: crate::video::renderer::ColorSpace::Bt709,
+                                color_range: crate::video::renderer::ColorRange::Limited,
                             }).is_ok() {}
                             while audio_tx.try_send(DecodedAudio {
                                 data: Vec::new(), pts_secs: -1.0, sample_rate: 0, channels: 0,

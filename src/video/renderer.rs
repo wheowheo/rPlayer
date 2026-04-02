@@ -24,12 +24,29 @@ pub enum FrameFormat {
     Rgba,
 }
 
+/// Color space for YUV→RGB matrix selection
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorSpace {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// Color range
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorRange {
+    Limited, // TV: Y 16-235, UV 16-240
+    Full,    // PC: 0-255
+}
+
 pub struct RawFrame {
     pub format: FrameFormat,
     pub width: u32,
     pub height: u32,
     pub planes: Vec<PlaneData>,
     pub pts_secs: f64,
+    pub color_space: ColorSpace,
+    pub color_range: ColorRange,
 }
 
 pub struct PlaneData {
@@ -38,6 +55,55 @@ pub struct PlaneData {
     pub stride: usize,
     pub width: u32,
     pub height: u32,
+}
+
+/// GPU-side color params (matches shader struct, 64 bytes)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuColorParams {
+    row0: [f32; 4],
+    row1: [f32; 4],
+    row2: [f32; 4],
+    range: [f32; 4],
+}
+
+impl GpuColorParams {
+    fn from_frame(cs: ColorSpace, cr: ColorRange) -> Self {
+        // YUV→RGB matrix coefficients
+        let (kr, kb) = match cs {
+            ColorSpace::Bt601  => (0.299_f32,  0.114_f32),
+            ColorSpace::Bt709  => (0.2126_f32, 0.0722_f32),
+            ColorSpace::Bt2020 => (0.2627_f32, 0.0593_f32),
+        };
+        let kg = 1.0 - kr - kb;
+
+        // Matrix: Y'CbCr → R'G'B' (after range normalization)
+        // R = Y + (2-2*Kr)*V
+        // G = Y - (2*Kb*(1-Kb)/Kg)*U - (2*Kr*(1-Kr)/Kg)*V
+        // B = Y + (2-2*Kb)*U
+        let rv = 2.0 * (1.0 - kr);
+        let gu = -2.0 * kb * (1.0 - kb) / kg;
+        let gv = -2.0 * kr * (1.0 - kr) / kg;
+        let bu = 2.0 * (1.0 - kb);
+
+        // Range normalization parameters
+        let (y_off, uv_off, y_scale, uv_scale) = match cr {
+            ColorRange::Limited => {
+                // Y: 16..235 → 0..1, UV: 16..240 → -0.5..0.5
+                (16.0 / 255.0, 128.0 / 255.0, 255.0 / (235.0 - 16.0), 255.0 / (240.0 - 16.0))
+            }
+            ColorRange::Full => {
+                (0.0, 128.0 / 255.0, 1.0, 1.0)
+            }
+        };
+
+        Self {
+            row0: [1.0, 0.0, rv, 0.0],
+            row1: [1.0, gu, gv, 0.0],
+            row2: [1.0, bu, 0.0, 0.0],
+            range: [y_off, uv_off, y_scale, uv_scale],
+        }
+    }
 }
 
 pub struct VideoRenderer {
@@ -53,8 +119,8 @@ pub struct VideoRenderer {
     layout_rgba: wgpu::BindGroupLayout,
 
     sampler: wgpu::Sampler,
+    color_buffer: Option<wgpu::Buffer>,
 
-    // Cached state — only rebuild when format/size changes
     bind_group: Option<wgpu::BindGroup>,
     current_format: Option<FrameFormat>,
     texture_size: (u32, u32),
@@ -111,14 +177,26 @@ impl VideoRenderer {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         };
+        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
 
+        // YUV: Y(0) U(1) V(2) sampler(3) uniform(4)
         let layout_yuv = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("yuv_layout"),
-            entries: &[tex_entry(0), tex_entry(1), tex_entry(2), sampler_entry(3)],
+            entries: &[tex_entry(0), tex_entry(1), tex_entry(2), sampler_entry(3), uniform_entry(4)],
         });
+        // NV12: Y(0) UV(1) sampler(2) uniform(3)
         let layout_nv12 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("nv12_layout"),
-            entries: &[tex_entry(0), tex_entry(1), sampler_entry(2)],
+            entries: &[tex_entry(0), tex_entry(1), sampler_entry(2), uniform_entry(3)],
         });
         let layout_rgba = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rgba_layout"),
@@ -171,6 +249,7 @@ impl VideoRenderer {
             index_buffer,
             layout_yuv, layout_nv12, layout_rgba,
             sampler,
+            color_buffer: None,
             bind_group: None,
             current_format: None,
             texture_size: (0, 0),
@@ -246,12 +325,23 @@ impl VideoRenderer {
             .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
             .collect();
 
-        self.rebuild_bind_group(device, frame.format);
+        self.rebuild_bind_group(device, frame);
     }
 
-    fn rebuild_bind_group(&mut self, device: &wgpu::Device, format: FrameFormat) {
+    fn rebuild_bind_group(&mut self, device: &wgpu::Device, frame: &RawFrame) {
         let views = &self.texture_views;
-        self.bind_group = Some(match format {
+        let params = GpuColorParams::from_frame(frame.color_space, frame.color_range);
+
+        // Create or update uniform buffer
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("color_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        self.color_buffer = Some(buf);
+        let color_buf = self.color_buffer.as_ref().unwrap();
+
+        self.bind_group = Some(match frame.format {
             FrameFormat::Yuv420p => device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("yuv_bg"), layout: &self.layout_yuv,
                 entries: &[
@@ -259,6 +349,7 @@ impl VideoRenderer {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 4, resource: color_buf.as_entire_binding() },
                 ],
             }),
             FrameFormat::Nv12 => device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -267,6 +358,7 @@ impl VideoRenderer {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: color_buf.as_entire_binding() },
                 ],
             }),
             FrameFormat::Rgba => device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -296,7 +388,11 @@ impl VideoRenderer {
                 Self::write_plane_fast(queue, &self.textures[0], &frame.planes[0], 4);
             }
         }
-        // bind_group already points to these textures — no rebuild needed
+        // Update color params uniform
+        if let Some(ref buf) = self.color_buffer {
+            let params = GpuColorParams::from_frame(frame.color_space, frame.color_range);
+            queue.write_buffer(buf, 0, bytemuck::bytes_of(&params));
+        }
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
