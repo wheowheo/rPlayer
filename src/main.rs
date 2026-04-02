@@ -1,20 +1,18 @@
-#[allow(dead_code)]
+#[cfg(feature = "ai")]
 mod ai;
 mod app;
 mod audio;
-#[allow(dead_code)]
+#[cfg(feature = "camera")]
 mod camera;
 #[allow(dead_code)]
 mod config;
-#[allow(dead_code)]
+#[cfg(feature = "ai")]
 mod db;
 mod decode;
 #[allow(dead_code)]
 mod error;
 mod media;
 mod subtitle;
-#[allow(dead_code)]
-mod ui;
 mod video;
 
 use std::sync::Arc;
@@ -129,6 +127,7 @@ impl ApplicationHandler for RPlayer {
                         PhysicalKey::Code(KeyCode::KeyM) => UiAction::MuteToggle,
                         // Tab is intercepted before egui (above)
                         PhysicalKey::Code(KeyCode::KeyR) => UiAction::ToggleDecoder,
+                        PhysicalKey::Code(KeyCode::KeyF) => UiAction::FrameStep,
                         PhysicalKey::Code(KeyCode::Equal) => {
                             if let Some(ref mut sub) = app.subtitle {
                                 sub.adjust_sync(0.5);

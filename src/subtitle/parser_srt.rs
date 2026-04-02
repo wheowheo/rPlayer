@@ -27,7 +27,7 @@ pub fn parse_srt(content: &str) -> Vec<SubtitleEntry> {
             text.push_str(lines.next().unwrap().trim());
         }
 
-        if !text.is_empty() {
+        if !text.is_empty() && start < end {
             entries.push(SubtitleEntry { start, end, text });
         }
     }

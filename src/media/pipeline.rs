@@ -19,7 +19,6 @@ pub enum PipelineCommand {
     SetDecodeMode(DecodeMode),
 }
 
-/// 0 = SW, 1 = HW
 const MODE_SW: u8 = 0;
 const MODE_HW: u8 = 1;
 
@@ -42,6 +41,7 @@ impl MediaPipeline {
             .ok_or_else(|| anyhow::anyhow!("No video stream found"))?
             .index;
         let audio_stream_index = info.audio.as_ref().map(|a| a.index);
+        let video_fps = info.video_fps;
 
         let (frame_tx, frame_rx) = bounded::<RawFrame>(3);
         let (audio_tx, audio_rx) = bounded::<DecodedAudio>(32);
@@ -58,7 +58,7 @@ impl MediaPipeline {
             .name("demux-decode".to_string())
             .spawn(move || {
                 if let Err(e) = decode_thread(
-                    &path_owned, video_stream_index, audio_stream_index,
+                    &path_owned, video_stream_index, audio_stream_index, video_fps,
                     hw, frame_tx, audio_tx, cmd_rx, running_clone, decode_mode_clone,
                 ) {
                     log::error!("Decode thread error: {}", e);
@@ -99,6 +99,7 @@ fn decode_thread(
     path: &str,
     video_stream_index: usize,
     audio_stream_index: Option<usize>,
+    video_fps: f64,
     initial_hw: bool,
     frame_tx: Sender<RawFrame>,
     audio_tx: Sender<DecodedAudio>,
@@ -111,10 +112,7 @@ fn decode_thread(
     let mut video_decoder = if initial_hw {
         match VideoDecoder::new_hw(&ictx, video_stream_index) {
             Ok(d) => {
-                decode_mode.store(
-                    if d.mode() == DecodeMode::Hardware { MODE_HW } else { MODE_SW },
-                    Ordering::Relaxed,
-                );
+                decode_mode.store(if d.mode() == DecodeMode::Hardware { MODE_HW } else { MODE_SW }, Ordering::Relaxed);
                 d
             }
             Err(e) => {
@@ -127,15 +125,16 @@ fn decode_thread(
         VideoDecoder::new_sw(&ictx, video_stream_index)?
     };
 
-    let mut audio_decoder = audio_stream_index.map(|idx| {
-        AudioDecoder::new(&ictx, idx)
-    }).transpose()?;
+    let mut audio_decoder = audio_stream_index.map(|idx| AudioDecoder::new(&ictx, idx)).transpose()?;
 
     let mut paused = false;
     let mut seek_target_pts: Option<f64> = None;
+    let mut last_video_pts: f64 = 0.0;
+
+    // Seek tolerance: 1.5 frames (fps-adaptive)
+    let seek_tolerance = if video_fps > 0.0 { 1.5 / video_fps } else { 0.1 };
 
     loop {
-        // Check commands
         loop {
             let cmd = if paused {
                 cmd_rx.recv_timeout(std::time::Duration::from_millis(50)).ok()
@@ -148,24 +147,24 @@ fn decode_thread(
                 Some(PipelineCommand::Pause) => paused = true,
                 Some(PipelineCommand::Resume) => { paused = false; break; }
                 Some(PipelineCommand::Seek(target)) => {
-                    if let Err(e) = demuxer::seek(&mut ictx, target, video_stream_index) {
-                        log::error!("Seek error: {}", e);
-                    } else {
-                        video_decoder.flush();
-                        if let Some(ref mut adec) = audio_decoder {
-                            adec.flush();
+                    match demuxer::seek(&mut ictx, target, video_stream_index) {
+                        Ok(()) => {
+                            video_decoder.flush();
+                            if let Some(ref mut adec) = audio_decoder { adec.flush(); }
+                            seek_target_pts = Some(target);
+                            // Drain channels with sentinel frames
+                            while frame_tx.try_send(RawFrame {
+                                format: crate::video::renderer::FrameFormat::Yuv420p,
+                                width: 2, height: 2, planes: vec![], pts_secs: -1.0,
+                            }).is_ok() {}
+                            while audio_tx.try_send(DecodedAudio {
+                                data: Vec::new(), pts_secs: -1.0, sample_rate: 0, channels: 0,
+                            }).is_ok() {}
                         }
-                        seek_target_pts = Some(target);
-                        while frame_tx.try_send(RawFrame {
-                            format: crate::video::renderer::FrameFormat::Yuv420p,
-                            width: 2, height: 2,
-                            planes: vec![],
-                            pts_secs: -1.0,
-                        }).is_ok() {}
-                        while audio_tx.try_send(DecodedAudio {
-                            data: Vec::new(), pts_secs: -1.0,
-                            sample_rate: 0, channels: 0,
-                        }).is_ok() {}
+                        Err(e) => {
+                            // Seek failed — don't touch playback state
+                            log::error!("Seek failed: {}", e);
+                        }
                     }
                     if paused { paused = false; }
                     break;
@@ -174,40 +173,35 @@ fn decode_thread(
                     let want_hw = new_mode == DecodeMode::Hardware;
                     let is_hw = video_decoder.mode() == DecodeMode::Hardware;
                     if want_hw != is_hw {
-                        // Reopen input and recreate decoder
-                        log::info!("Switching to {:?} decoder", new_mode);
-                        // Remember current position from last decoded frame PTS
-                        let current_pos = seek_target_pts.unwrap_or(0.0);
+                        log::info!("Switching to {:?} decoder at {:.1}s", new_mode, last_video_pts);
+                        let resume_pos = last_video_pts;
 
                         drop(video_decoder);
                         let (new_ictx, _) = demuxer::open_input(path)?;
                         ictx = new_ictx;
 
                         video_decoder = if want_hw {
-                            match VideoDecoder::new_hw(&ictx, video_stream_index) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    log::warn!("HW decoder switch failed: {}", e);
-                                    VideoDecoder::new_sw(&ictx, video_stream_index)?
-                                }
-                            }
+                            VideoDecoder::new_hw(&ictx, video_stream_index)
+                                .unwrap_or_else(|e| {
+                                    log::warn!("HW switch failed: {}", e);
+                                    VideoDecoder::new_sw(&ictx, video_stream_index).unwrap()
+                                })
                         } else {
                             VideoDecoder::new_sw(&ictx, video_stream_index)?
                         };
 
-                        audio_decoder = audio_stream_index.map(|idx| {
-                            AudioDecoder::new(&ictx, idx)
-                        }).transpose()?;
+                        audio_decoder = audio_stream_index
+                            .map(|idx| AudioDecoder::new(&ictx, idx)).transpose()?;
 
                         decode_mode.store(
                             if video_decoder.mode() == DecodeMode::Hardware { MODE_HW } else { MODE_SW },
                             Ordering::Relaxed,
                         );
 
-                        // Seek back to position
-                        if current_pos > 0.5 {
-                            let _ = demuxer::seek(&mut ictx, current_pos, video_stream_index);
-                            seek_target_pts = Some(current_pos);
+                        // Always seek back to current position
+                        if resume_pos > 0.0 {
+                            let _ = demuxer::seek(&mut ictx, resume_pos, video_stream_index);
+                            seek_target_pts = Some(resume_pos);
                         }
                     }
                     break;
@@ -219,9 +213,7 @@ fn decode_thread(
             }
         }
 
-        if !running.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+        if !running.load(Ordering::Relaxed) { return Ok(()); }
 
         let mut packet = Packet::empty();
         match packet.read(&mut ictx) {
@@ -233,27 +225,23 @@ fn decode_thread(
         let stream_index = packet.stream();
 
         if stream_index == video_stream_index {
-            if video_decoder.send_packet(&packet).is_err() {
-                continue;
-            }
+            if video_decoder.send_packet(&packet).is_err() { continue; }
             loop {
                 match video_decoder.receive_frame() {
                     Ok(Some(frame)) => {
                         if let Some(target) = seek_target_pts {
-                            if frame.pts_secs < target - 0.1 {
+                            if frame.pts_secs < target - seek_tolerance {
                                 continue;
                             }
                             seek_target_pts = None;
                         }
-                        // Block briefly if queue full — renderer drains at 60fps
+                        last_video_pts = frame.pts_secs;
                         match frame_tx.send_timeout(frame, std::time::Duration::from_millis(50)) {
                             Ok(()) => {}
                             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                                // Queue stuck — drop this frame to stay responsive to commands
+                                log::debug!("Video queue full, frame dropped at {:.3}s", last_video_pts);
                             }
-                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                return Ok(());
-                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return Ok(()),
                         }
                     }
                     Ok(None) => break,
@@ -262,16 +250,12 @@ fn decode_thread(
             }
         } else if Some(stream_index) == audio_stream_index {
             if let Some(ref mut adec) = audio_decoder {
-                if adec.send_packet(&packet).is_err() {
-                    continue;
-                }
+                if adec.send_packet(&packet).is_err() { continue; }
                 loop {
                     match adec.receive_frame() {
                         Ok(Some(audio)) => {
                             if let Some(target) = seek_target_pts {
-                                if audio.pts_secs < target - 0.1 {
-                                    continue;
-                                }
+                                if audio.pts_secs < target - seek_tolerance { continue; }
                             }
                             if audio_tx.send(audio).is_err() { return Ok(()); }
                         }
@@ -295,9 +279,7 @@ fn decode_thread(
         let _ = adec.send_eof();
         loop {
             match adec.receive_frame() {
-                Ok(Some(audio)) => {
-                    if audio_tx.send(audio).is_err() { return Ok(()); }
-                }
+                Ok(Some(audio)) => { if audio_tx.send(audio).is_err() { return Ok(()); } }
                 _ => break,
             }
         }

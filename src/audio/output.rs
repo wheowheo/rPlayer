@@ -175,11 +175,19 @@ impl AudioOutput {
     }
 
     pub fn flush(&self) {
-        self.paused.store(true, Ordering::Relaxed);
-        { self.buffer.lock().clear(); }
-        self.samples_played.store(0, Ordering::Relaxed);
-        { let mut vis = self.vis.lock(); vis.peak_l = 0.0; vis.peak_r = 0.0; vis.waveform.clear(); }
-        self.paused.store(false, Ordering::Relaxed);
+        self.paused.store(true, Ordering::SeqCst);
+        {
+            let mut buf = self.buffer.lock();
+            buf.clear();
+        }
+        self.samples_played.store(0, Ordering::SeqCst);
+        {
+            let mut vis = self.vis.lock();
+            vis.peak_l = 0.0;
+            vis.peak_r = 0.0;
+            vis.waveform.clear();
+        }
+        // Don't auto-resume — caller controls pause state
     }
 
     #[allow(dead_code)]

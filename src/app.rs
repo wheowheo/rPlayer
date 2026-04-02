@@ -37,6 +37,7 @@ pub enum UiAction {
     ToggleDecoder,
     ToggleInfoOverlay,
     SeekTo(f64),
+    FrameStep,
 }
 
 pub struct UiState {
@@ -55,6 +56,7 @@ pub struct UiState {
     pub context_menu_pos: egui::Pos2,
     pub frames_dropped: u64,
     pub frames_displayed: u64,
+    pub recent_drop_rate: f64, // rolling 300-frame window
     // Audio visualization
     pub audio_peak_l: f32,
     pub audio_peak_r: f32,
@@ -87,6 +89,7 @@ pub struct App {
     video_fps: f64,
     fps_counter: u32,
     fps_last_time: std::time::Instant,
+    frame_history: std::collections::VecDeque<bool>, // true=displayed, false=dropped (last 300)
 
     // Subtitle
     pub subtitle: Option<SubtitleTrack>,
@@ -490,11 +493,7 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     ui.label(egui::RichText::new(
                         format!("decoder: {}", state.decode_mode)
                     ).monospace().size(14.0));
-                    let drop_rate = if state.frames_displayed > 0 {
-                        state.frames_dropped as f64 / (state.frames_displayed + state.frames_dropped) as f64 * 100.0
-                    } else {
-                        0.0
-                    };
+                    let drop_rate = state.recent_drop_rate;
                     let drop_color = if drop_rate > 5.0 {
                         egui::Color32::from_rgb(255, 80, 80)
                     } else if drop_rate > 1.0 {
@@ -676,6 +675,7 @@ fn configure_fonts(ctx: &egui::Context) {
 }
 
 fn format_time(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 { return "0:00".to_string(); }
     let total = secs as u64;
     let h = total / 3600;
     let m = (total % 3600) / 60;
@@ -780,6 +780,7 @@ impl App {
                 context_menu_pos: egui::Pos2::ZERO,
                 frames_dropped: 0,
                 frames_displayed: 0,
+                recent_drop_rate: 0.0,
                 audio_peak_l: 0.0,
                 audio_peak_r: 0.0,
                 audio_waveform: Vec::new(),
@@ -791,6 +792,7 @@ impl App {
             video_fps: 0.0,
             fps_counter: 0,
             fps_last_time: std::time::Instant::now(),
+            frame_history: std::collections::VecDeque::with_capacity(300),
             subtitle: None,
             window,
             video_size: None,
@@ -933,13 +935,30 @@ impl App {
             }
         }
 
+        // Rolling frame drop rate (300-frame window)
+        self.frame_history.push_back(displayed);
+        if self.frame_history.len() > 300 {
+            self.frame_history.pop_front();
+        }
+        if !self.frame_history.is_empty() {
+            let drops = self.frame_history.iter().filter(|&&ok| !ok).count();
+            self.ui_state.recent_drop_rate = drops as f64 / self.frame_history.len() as f64 * 100.0;
+        }
+
         // Update audio visualization data
         if let Some(ref audio) = self.audio_output {
-            let vis = audio.vis.lock();
-            self.ui_state.audio_peak_l = vis.peak_l;
-            self.ui_state.audio_peak_r = vis.peak_r;
-            if self.ui_state.show_info_overlay {
-                self.ui_state.audio_waveform = vis.waveform.clone();
+            if let Some(vis) = audio.vis.try_lock() {
+                self.ui_state.audio_peak_l = vis.peak_l;
+                self.ui_state.audio_peak_r = vis.peak_r;
+                if self.ui_state.show_info_overlay {
+                    // Swap instead of clone to avoid allocation
+                    let mut waveform = std::mem::take(&mut self.ui_state.audio_waveform);
+                    waveform.clear();
+                    let n = vis.waveform.len().min(2048);
+                    let start = vis.waveform.len().saturating_sub(n);
+                    waveform.extend_from_slice(&vis.waveform[start..]);
+                    self.ui_state.audio_waveform = waveform;
+                }
             }
         }
     }
@@ -1034,6 +1053,22 @@ impl App {
             }
             UiAction::ToggleInfoOverlay => {
                 self.ui_state.show_info_overlay = !self.ui_state.show_info_overlay;
+            }
+            UiAction::FrameStep => {
+                // Pause + advance one frame
+                if self.ui_state.playback_state == PlaybackState::Playing {
+                    self.handle_action(&UiAction::PlayPause);
+                }
+                // Take one frame from queue and display
+                if let Some(ref pipeline) = self.pipeline {
+                    if let Ok(frame) = pipeline.frame_rx.try_recv() {
+                        if !frame.planes.is_empty() && frame.pts_secs >= 0.0 {
+                            self.ui_state.current_time = frame.pts_secs;
+                            self.video_renderer.upload_frame(&self.device, &self.queue, &frame);
+                            self.ui_state.frames_displayed += 1;
+                        }
+                    }
+                }
             }
         }
     }

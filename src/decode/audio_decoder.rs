@@ -92,10 +92,15 @@ impl AudioDecoder {
                 let total_floats = samples * channels;
 
                 let byte_data = resampled.data(0);
+                let usable_bytes = byte_data.len() & !3; // align to 4-byte boundary
+                let float_count = total_floats.min(usable_bytes / 4);
+                if float_count == 0 {
+                    return Ok(None);
+                }
                 let float_data: &[f32] = unsafe {
                     std::slice::from_raw_parts(
                         byte_data.as_ptr() as *const f32,
-                        total_floats.min(byte_data.len() / 4),
+                        float_count,
                     )
                 };
 
