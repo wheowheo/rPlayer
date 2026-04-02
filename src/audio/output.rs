@@ -7,19 +7,41 @@ use parking_lot::Mutex;
 
 use crate::config;
 use crate::decode::audio_decoder::DecodedAudio;
+use super::dsp::{Equalizer, Compressor};
+use super::stretch::TimeStretcher;
 
-/// Shared audio visualization data (updated by callback, read by UI)
 pub struct AudioVis {
-    /// Per-channel peak level (0.0~1.0), updated every callback
     pub peak_l: f32,
     pub peak_r: f32,
-    /// Recent PCM waveform samples for oscilloscope (mono mix, last ~2048 samples)
     pub waveform: Vec<f32>,
 }
 
 impl Default for AudioVis {
     fn default() -> Self {
         Self { peak_l: 0.0, peak_r: 0.0, waveform: Vec::new() }
+    }
+}
+
+/// Shared DSP parameters (set from UI thread, read by feed thread)
+pub struct DspParams {
+    pub speed: f64,
+    pub eq_bass: f32,   // dB
+    pub eq_mid: f32,
+    pub eq_treble: f32,
+    pub compressor_enabled: bool,
+    pub compressor_threshold: f32, // dB
+    pub compressor_ratio: f32,
+}
+
+impl Default for DspParams {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            eq_bass: 0.0, eq_mid: 0.0, eq_treble: 0.0,
+            compressor_enabled: false,
+            compressor_threshold: -10.0,
+            compressor_ratio: 4.0,
+        }
     }
 }
 
@@ -31,6 +53,7 @@ pub struct AudioOutput {
     buffer: Arc<Mutex<VecDeque<f32>>>,
     paused: Arc<AtomicBool>,
     pub vis: Arc<Mutex<AudioVis>>,
+    pub dsp: Arc<Mutex<DspParams>>,
     #[allow(dead_code)]
     sample_rate: u32,
 }
@@ -45,7 +68,7 @@ impl AudioOutput {
 
         log::info!("Audio device: {:?}", device.name());
 
-        let config = cpal::StreamConfig {
+        let stream_config = cpal::StreamConfig {
             channels: config::AUDIO_CHANNELS,
             sample_rate: cpal::SampleRate(config::AUDIO_SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
@@ -55,12 +78,14 @@ impl AudioOutput {
         let muted = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
         let vis = Arc::new(Mutex::new(AudioVis::default()));
+        let dsp = Arc::new(Mutex::new(DspParams::default()));
 
         let volume_clone = volume.clone();
         let muted_clone = muted.clone();
         let samples_played_clone = samples_played.clone();
         let paused_clone = paused.clone();
         let vis_clone = vis.clone();
+        let dsp_clone = dsp.clone();
 
         let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(
             VecDeque::with_capacity(config::AUDIO_RING_BUFFER_SIZE),
@@ -68,13 +93,55 @@ impl AudioOutput {
         let buffer_feed = buffer.clone();
         let buffer_callback = buffer.clone();
 
+        let sr = config::AUDIO_SAMPLE_RATE as f32;
+        let ch = config::AUDIO_CHANNELS;
+
+        // Feed thread: decode → stretch → EQ → compress → buffer
         std::thread::Builder::new()
             .name("audio-feed".to_string())
             .spawn(move || {
+                let mut stretcher = TimeStretcher::new(config::AUDIO_SAMPLE_RATE, ch);
+                let mut eq = Equalizer::new(sr);
+                let mut compressor = Compressor::new(sr);
+                let mut last_speed = 1.0_f64;
+                let mut last_eq = (0.0_f32, 0.0_f32, 0.0_f32);
+                let mut last_comp = (false, -10.0_f32, 4.0_f32);
+
                 while let Ok(audio) = audio_rx.recv() {
+                    // Read DSP params (try_lock to avoid blocking decode thread)
+                    if let Some(params) = dsp_clone.try_lock() {
+                        if (params.speed - last_speed).abs() > 0.001 {
+                            stretcher.set_speed(params.speed);
+                            last_speed = params.speed;
+                        }
+                        let eq_key = (params.eq_bass, params.eq_mid, params.eq_treble);
+                        if eq_key != last_eq {
+                            eq.set_bands(params.eq_bass, params.eq_mid, params.eq_treble, sr);
+                            last_eq = eq_key;
+                        }
+                        let comp_key = (params.compressor_enabled, params.compressor_threshold, params.compressor_ratio);
+                        if comp_key != last_comp {
+                            compressor.enabled = params.compressor_enabled;
+                            compressor.threshold = params.compressor_threshold;
+                            compressor.ratio = params.compressor_ratio;
+                            last_comp = comp_key;
+                        }
+                    }
+
+                    // 1. Time-stretch
+                    let mut processed = stretcher.process(&audio.data);
+                    if processed.is_empty() {
+                        continue;
+                    }
+
+                    // 2. EQ + Compress
+                    eq.process_stereo(&mut processed);
+                    compressor.process_stereo(&mut processed);
+
+                    // 3. Feed to output buffer
                     let mut buf = buffer_feed.lock();
                     if buf.len() < config::AUDIO_RING_BUFFER_SIZE * 2 {
-                        buf.extend(audio.data.iter());
+                        buf.extend(processed.iter());
                     }
                 }
             })?;
@@ -82,7 +149,7 @@ impl AudioOutput {
         let channels = config::AUDIO_CHANNELS as usize;
 
         let stream = device.build_output_stream(
-            &config,
+            &stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if paused_clone.load(Ordering::Relaxed) {
                     for s in data.iter_mut() { *s = 0.0; }
@@ -96,14 +163,12 @@ impl AudioOutput {
                 let mut buf = buffer_callback.lock();
                 let available = buf.len().min(data.len());
 
-                // Peak detection
                 let mut peak_l: f32 = 0.0;
                 let mut peak_r: f32 = 0.0;
 
                 for i in 0..available {
                     let sample = buf[i] * gain;
                     data[i] = sample;
-                    // Channel peak (interleaved stereo)
                     if channels == 2 {
                         if i % 2 == 0 { peak_l = peak_l.max(sample.abs()); }
                         else { peak_r = peak_r.max(sample.abs()); }
@@ -119,29 +184,22 @@ impl AudioOutput {
                 let frames = available as u64 / channels as u64;
                 samples_played_clone.fetch_add(frames, Ordering::Relaxed);
 
-                // Update visualization data (try_lock to avoid blocking audio thread)
                 if let Some(mut vis) = vis_clone.try_lock() {
-                    // Exponential decay for smooth meters
                     vis.peak_l = vis.peak_l * 0.8 + peak_l * 0.2;
                     vis.peak_r = vis.peak_r * 0.8 + peak_r * 0.2;
-                    // But ensure peaks actually reach max
                     if peak_l > vis.peak_l { vis.peak_l = peak_l; }
                     if peak_r > vis.peak_r { vis.peak_r = peak_r; }
 
-                    // Waveform: downsample to mono and append
-                    let mono_samples: usize = available / channels;
+                    let mono_samples = available / channels;
                     for i in 0..mono_samples {
                         let idx = i * channels;
                         if idx < available {
                             let mono = if channels == 2 && idx + 1 < available {
                                 (data[idx] + data[idx + 1]) * 0.5
-                            } else {
-                                data[idx]
-                            };
+                            } else { data[idx] };
                             vis.waveform.push(mono);
                         }
                     }
-                    // Keep only last WAVEFORM_SIZE samples
                     if vis.waveform.len() > WAVEFORM_SIZE * 2 {
                         let drain = vis.waveform.len() - WAVEFORM_SIZE;
                         vis.waveform.drain(..drain);
@@ -157,7 +215,7 @@ impl AudioOutput {
         Ok(Self {
             _stream: stream,
             volume, muted, samples_played,
-            buffer, paused, vis,
+            buffer, paused, vis, dsp,
             sample_rate: config::AUDIO_SAMPLE_RATE,
         })
     }
@@ -174,29 +232,41 @@ impl AudioOutput {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
+    pub fn set_speed(&self, speed: f64) {
+        if let Some(mut params) = self.dsp.try_lock() {
+            params.speed = speed;
+        }
+    }
+
+    pub fn set_eq(&self, bass: f32, mid: f32, treble: f32) {
+        if let Some(mut params) = self.dsp.try_lock() {
+            params.eq_bass = bass;
+            params.eq_mid = mid;
+            params.eq_treble = treble;
+        }
+    }
+
+    pub fn set_compressor(&self, enabled: bool, threshold: f32, ratio: f32) {
+        if let Some(mut params) = self.dsp.try_lock() {
+            params.compressor_enabled = enabled;
+            params.compressor_threshold = threshold;
+            params.compressor_ratio = ratio;
+        }
+    }
+
     pub fn flush(&self) {
         self.paused.store(true, Ordering::SeqCst);
-        {
-            let mut buf = self.buffer.lock();
-            buf.clear();
-        }
+        { self.buffer.lock().clear(); }
         self.samples_played.store(0, Ordering::SeqCst);
         {
             let mut vis = self.vis.lock();
-            vis.peak_l = 0.0;
-            vis.peak_r = 0.0;
-            vis.waveform.clear();
+            vis.peak_l = 0.0; vis.peak_r = 0.0; vis.waveform.clear();
         }
-        // Don't auto-resume — caller controls pause state
     }
 
     #[allow(dead_code)]
-    pub fn samples_played(&self) -> u64 {
-        self.samples_played.load(Ordering::Relaxed)
-    }
+    pub fn samples_played(&self) -> u64 { self.samples_played.load(Ordering::Relaxed) }
 
     #[allow(dead_code)]
-    pub fn playback_time_secs(&self) -> f64 {
-        self.samples_played() as f64 / self.sample_rate as f64
-    }
+    pub fn playback_time_secs(&self) -> f64 { self.samples_played() as f64 / self.sample_rate as f64 }
 }

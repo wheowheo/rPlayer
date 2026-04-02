@@ -59,6 +59,11 @@ pub struct UiState {
     pub frames_dropped: u64,
     pub frames_displayed: u64,
     pub recent_drop_rate: f64, // rolling 300-frame window
+    // Audio DSP
+    pub eq_bass: f32,
+    pub eq_mid: f32,
+    pub eq_treble: f32,
+    pub compressor_enabled: bool,
     // Audio visualization
     pub audio_peak_l: f32,
     pub audio_peak_r: f32,
@@ -184,6 +189,22 @@ fn draw_ui(ctx: &egui::Context, state: &mut UiState) -> Vec<UiAction> {
                     actions.push(UiAction::MuteToggle);
                     ui.close_menu();
                 }
+                ui.separator();
+                ui.label("이퀄라이저");
+                ui.horizontal(|ui| {
+                    ui.label("Bass");
+                    ui.add(egui::DragValue::new(&mut state.eq_bass).range(-12.0..=12.0).speed(0.5).suffix("dB"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Mid ");
+                    ui.add(egui::DragValue::new(&mut state.eq_mid).range(-12.0..=12.0).speed(0.5).suffix("dB"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Treble");
+                    ui.add(egui::DragValue::new(&mut state.eq_treble).range(-12.0..=12.0).speed(0.5).suffix("dB"));
+                });
+                ui.separator();
+                ui.checkbox(&mut state.compressor_enabled, "컴프레서");
             });
             ui.menu_button("보기", |ui| {
                 let info_label = if state.show_info_overlay { "정보 숨기기  Tab" } else { "정보 보기    Tab" };
@@ -865,6 +886,10 @@ impl App {
                 frames_dropped: 0,
                 frames_displayed: 0,
                 recent_drop_rate: 0.0,
+                eq_bass: 0.0,
+                eq_mid: 0.0,
+                eq_treble: 0.0,
+                compressor_enabled: false,
                 audio_peak_l: 0.0,
                 audio_peak_r: 0.0,
                 audio_waveform: Vec::new(),
@@ -1125,11 +1150,17 @@ impl App {
                 if let Some(ref mut clock) = self.clock {
                     clock.set_speed(self.ui_state.speed);
                 }
+                if let Some(ref audio) = self.audio_output {
+                    audio.set_speed(self.ui_state.speed);
+                }
             }
             UiAction::SpeedDown => {
                 self.ui_state.speed = (self.ui_state.speed - config::SPEED_STEP).max(config::MIN_SPEED);
                 if let Some(ref mut clock) = self.clock {
                     clock.set_speed(self.ui_state.speed);
+                }
+                if let Some(ref audio) = self.audio_output {
+                    audio.set_speed(self.ui_state.speed);
                 }
             }
             UiAction::ToggleDecoder => {
@@ -1256,9 +1287,11 @@ impl App {
         for action in &actions {
             self.handle_action(action);
         }
-        // Sync volume slider back to audio
+        // Sync UI values to audio DSP
         if let Some(ref audio) = self.audio_output {
             audio.set_volume(self.ui_state.volume);
+            audio.set_eq(self.ui_state.eq_bass, self.ui_state.eq_mid, self.ui_state.eq_treble);
+            audio.set_compressor(self.ui_state.compressor_enabled, -10.0, 4.0);
         }
 
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
