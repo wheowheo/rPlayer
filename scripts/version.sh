@@ -52,8 +52,12 @@ fi
 
 echo -e "${B}버전 변경: $CURRENT → $NEW_VERSION${NC}"
 
-# Cargo.toml 업데이트
-sed -i '' "0,/^version = \"$CURRENT\"/s//version = \"$NEW_VERSION\"/" Cargo.toml
+# Cargo.toml 업데이트 (macOS + Linux 호환)
+if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" Cargo.toml
+else
+    sed -i "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" Cargo.toml
+fi
 echo -e "${G}Cargo.toml 업데이트${NC}"
 
 # Cargo.lock 갱신
